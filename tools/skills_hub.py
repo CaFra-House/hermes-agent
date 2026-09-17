@@ -76,17 +76,6 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        return _plugin_compat_prev_getattr(name)
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
-
-
 # ---------------------------------------------------------------------------
 # Install-path safety + guarded HTTP
 # ---------------------------------------------------------------------------
@@ -453,3 +442,14 @@ _PLUGIN_COMPAT_LAZY = {
 }
 
 _plugin_compat_prev_getattr = __getattr__
+
+
+def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        return _plugin_compat_prev_getattr(name)
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
