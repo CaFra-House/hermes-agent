@@ -327,3 +327,45 @@ def test_flushed_overflow_is_replayed_by_recover_pending_to_db(tmp_path, monkeyp
 def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({}) == 0
     assert flush_overflow_to_file({"k": []}) == 0
+
+
+def test_recover_quarantines_fk_orphan_and_continues(tmp_path, monkeypatch):
+    """A payload whose session_id no longer exists in ``sessions`` raises
+    ``sqlite3.IntegrityError`` (FOREIGN KEY).  That failure is permanent: the row can
+    never be inserted, so the file must be quarantined out of the replay glob instead of
+    being preserved and re-poisoning every subsequent boot.  Sibling payloads must still
+    recover, and a second pass must see no poison file left behind.
+    """
+    import sqlite3
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    orphan = _write_flush_file(flush_dir, "pending-a.json", "sid-gone", "orphaned msg")
+    good = _write_flush_file(flush_dir, "pending-b.json", "sid-live", "live msg")
+
+    class FkFailingDB:
+        def __init__(self):
+            self.appended = []
+
+        def append_message(self, **kwargs):
+            if kwargs["session_id"] == "sid-gone":
+                raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+            self.appended.append(kwargs["session_id"])
+
+    db = FkFailingDB()
+    assert recover_pending_to_db(db) == 1
+    assert db.appended == ["sid-live"]
+    # The live file is consumed; the FK orphan is NOT deleted — it is moved to the
+    # dead-letter subdir, out of the ``*.json`` replay glob.
+    assert not good.exists()
+    assert not orphan.exists()
+    quarantined = list((flush_dir / "orphaned").glob("*.json"))
+    assert [f.name for f in quarantined] == ["pending-a.json"]
+    # The payload is preserved verbatim for forensics.
+    assert json.loads(quarantined[0].read_text(encoding="utf-8"))["data"]["session_id"] == "sid-gone"
+    # No poison file remains in the replay glob: a second boot pass is a clean no-op.
+    assert list(flush_dir.glob("*.json")) == []
+    assert recover_pending_to_db(db) == 0
+    assert db.appended == ["sid-live"]

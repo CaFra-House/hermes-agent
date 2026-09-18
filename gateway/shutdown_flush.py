@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -210,7 +211,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
     gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
+    flush_dir = _get_flush_dir()
+    flush_files = sorted(flush_dir.glob("*.json"))
     if not flush_files:
         return 0
     own_db = session_db is None
@@ -232,6 +234,12 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
                                         session_resolver=session_resolver):
                     recovered += 1
                     path.unlink(missing_ok=True)
+            except sqlite3.IntegrityError as exc:
+                # Permanent referential failure (the payload's session_id no longer exists in
+                # ``sessions``): the INSERT can never succeed, so preserving the file would
+                # re-poison every boot with a FOREIGN KEY warning. Quarantine it to a
+                # dead-letter subdir (out of the ``*.json`` replay glob) for operator forensics.
+                _quarantine_orphaned_payload(path, flush_dir, exc)
             except Exception as exc:
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
@@ -242,6 +250,43 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     if recovered:
         logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
     return recovered
+
+
+def _quarantine_orphaned_payload(path: Path, flush_dir: Path, exc: sqlite3.IntegrityError) -> None:
+    """Move a permanently unrecoverable spool file out of the replay glob.
+
+    The file's ``session_id`` no longer exists in ``sessions`` (or the row violates another
+    integrity constraint), so no future boot can insert it either.  Keeping it in
+    ``flush_dir`` would re-raise the same ``IntegrityError`` on every gateway start.  The
+    payload is preserved verbatim under ``<flush_dir>/orphaned/`` (a subdir, so the
+    ``glob("*.json")`` replay pass never sees it again) for operator forensics.
+    """
+    orphaned_dir = flush_dir / "orphaned"
+    try:
+        orphaned_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix":
+            os.chmod(orphaned_dir, 0o700)
+        path.rename(orphaned_dir / path.name)
+    except OSError as move_exc:
+        # Renaming failed (e.g. cross-device); fall back to copy + unlink so the replay
+        # glob still stops seeing the poison file.
+        logger.warning(
+            "Quarantine rename failed for %s (%s); falling back to copy+unlink", path, move_exc
+        )
+        try:
+            (orphaned_dir / path.name).write_bytes(path.read_bytes())
+            path.unlink(missing_ok=True)
+        except OSError as copy_exc:
+            logger.warning(
+                "Could not quarantine orphaned pending message %s: %s (left in place)",
+                path, copy_exc,
+            )
+            return
+    logger.info(
+        "Quarantined unrecoverable pending message %s (session no longer exists; %s) "
+        "to %s — it will not be retried on future boots",
+        path.name, exc, orphaned_dir,
+    )
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
