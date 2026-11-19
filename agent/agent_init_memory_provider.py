@@ -120,6 +120,7 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
         # a fork that loads a provider only for the checkpoint gate names its scope (memory_agent_context).
         "agent_context": getattr(agent, "memory_agent_context", None)
         or (platform if platform in ("cron", "subagent") else "primary"),
+        **({"allow_fork_hooks": True} if getattr(agent, "inherit_memory_hooks", False) else {}),
     }
     # Documented in MemoryProvider.initialize: forks tell their shape apart by platform + parent.
     if getattr(agent, "_parent_session_id", None):

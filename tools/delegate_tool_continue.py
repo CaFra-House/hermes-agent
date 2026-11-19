@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from tools import delegate_tool_config
-from tools.delegate_tool_config import _get_max_concurrent_children, _get_max_spawn_depth
+from tools.delegate_tool_config import _get_max_concurrent_children, _get_max_concurrent_children_for_depth, _get_max_spawn_depth
 from tools.registry import tool_error
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
@@ -216,7 +216,7 @@ def _start(
                 return None, cancelled
     batch = _Batch(
         task_list, [(0, task_list[0], children[0][2])], parent_agent, route.creds, None, "leaf",
-        _get_max_concurrent_children(), live_id, writers, paths, *origin, time.monotonic(), live_home=live_home,
+        _get_max_concurrent_children_for_depth(getattr(parent_agent, "_delegate_depth", 0)), live_id, writers, paths, *origin, time.monotonic(), live_home=live_home,
         detached_only=run_origin == "auto",
     )
     return _run_batch(batch, background), None

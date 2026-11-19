@@ -17,6 +17,7 @@ logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the 
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
+_DEFAULT_MAX_CONCURRENT_GRANDCHILDREN = 2
 # One-shot guard: _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild, so the >10 cost advisory would otherwise log on every turn.
 _HIGH_CONCURRENCY_WARNED = False
@@ -112,6 +113,28 @@ def _get_max_concurrent_children() -> int:
         )
     return result
 
+
+def _get_max_concurrent_grandchildren() -> int:
+    """delegation.max_concurrent_grandchildren > DELEGATION_MAX_CONCURRENT_GRANDCHILDREN env > 2.
+
+    CAFRA 2026-11-19: Caps concurrency for subagents spawning grandchildren (depth >= 1)
+    to keep the 4x2 hierarchy bounded (parent -> 4 children, each child -> up to 2 grandchildren).
+    """
+    return _knob(
+        "max_concurrent_grandchildren", "DELEGATION_MAX_CONCURRENT_GRANDCHILDREN", lambda v: max(1, int(v)),
+        _DEFAULT_MAX_CONCURRENT_GRANDCHILDREN,
+        f"delegation.max_concurrent_grandchildren=%r is not a valid integer; using default {_DEFAULT_MAX_CONCURRENT_GRANDCHILDREN}",
+    )
+
+
+def _get_max_concurrent_children_for_depth(depth: int = 0) -> int:
+    """Depth-aware concurrency cap: depth 0 uses max_concurrent_children; depth >= 1 is capped at
+    min(max_concurrent_children, max_concurrent_grandchildren)."""
+    base = _get_max_concurrent_children()
+    if depth >= 1:
+        return min(base, _get_max_concurrent_grandchildren())
+    return base
+
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
@@ -165,8 +188,9 @@ def _get_worktree_isolation() -> bool:
     working copy. Git-only and local-backend-only; otherwise silently ignored."""
     return bool(_load_config().get("worktree_isolation", False))
 
-def _get_max_async_children() -> int:
-    """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async
+def _get_max_async_children(depth: int = 0) -> int:
+    """Concurrency cap for background delegations == delegation.max_concurrent_children (or
+    max_concurrent_grandchildren at depth >= 1). At capacity a new async
     dispatch is REJECTED (not queued) so a runaway model can't pile up unbounded background work; the caller then
     runs synchronously. A leftover ``delegation.max_async_children`` key is ignored with a one-time warning."""
     if _load_config().get("max_async_children") is not None:
@@ -175,7 +199,7 @@ def _get_max_async_children() -> int:
             "delegation.max_concurrent_children now caps background "
             "delegations too. Remove the stale key from config.yaml.",
         )
-    return _get_max_concurrent_children()
+    return _get_max_concurrent_children_for_depth(depth)
 
 def _parse_timeout(raw: Any) -> Optional[float]:
     """Seconds → None (<= 0 disables) or max(30, value). Raises on non-numeric."""

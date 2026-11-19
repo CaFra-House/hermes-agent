@@ -241,6 +241,7 @@ class MemoryManager:
         # turn writes and recall must not reach the user's memory. "primary" until initialized, so the legacy
         # construction path keeps writing.
         self._agent_context = "primary"
+        self._allow_fork_hooks = False
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
@@ -264,8 +265,10 @@ class MemoryManager:
         """A fork's writes and recall (on_turn_start, sync, prefetch, session-end extraction, delegation notes)
         stay off on the host, independent of whether each provider honours ``agent_context``: before the
         checkpoint gate armed them, forks ran with no provider at all. ``initialize``, ``on_session_switch``
-        and ``on_pre_compress`` (the checkpoint) are not gated."""
-        return self._agent_context == "subagent"
+        and ``on_pre_compress`` (the checkpoint) are not gated.
+        CAFRA 2026-11-19: When ``allow_fork_hooks=True`` (``delegation.inherit_memory: true``), allow
+        external memory provider hooks (Hindsight auto_recall/auto_retain) while MEMORY.md/USER.md stay off."""
+        return self._agent_context == "subagent" and not self._allow_fork_hooks
 
     def _tool_call_keywords(self, provider: MemoryProvider) -> Optional[frozenset[str]]:
         """The keywords ``provider.handle_tool_call`` declares; None when it takes any (``**kwargs``, or
@@ -954,8 +957,14 @@ class MemoryManager:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         self._bound_scope = bound_scope(kwargs["hermes_home"], kwargs.get("agent_identity"))
+        self._allow_fork_hooks = bool(kwargs.pop("allow_fork_hooks", False))
         _context = kwargs.get("agent_context")
         self._agent_context = _context if isinstance(_context, str) and _context.strip() else "primary"
+        if self._allow_fork_hooks and self._agent_context == "subagent":
+            # CAFRA 2026-11-19: Let external providers (e.g. Hindsight >= f14cc1eb) run full
+            # auto_recall/auto_retain for delegated children opting into inherit_memory, while
+            # AIAgent keeps memory_agent_context="subagent" so MEMORY.md/USER.md remain untouched.
+            kwargs["agent_context"] = "primary"
         # One instance, one profile: never rebind an instance another profile's manager bound (#140058).
         for provider in [p for p in self._providers if p.name != "builtin"]:
             if not claim_instance(provider, kwargs["hermes_home"], manager=self):

@@ -468,9 +468,8 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     try:
         get_mem_schemas = _schema_getter("_memory_manager", "get_all_tool_schemas")
         if get_mem_schemas is not None:
-            from agent.memory_manager_tools import memory_provider_tools_enabled  # same gate inject_memory_provider_tools uses
-            if memory_provider_tools_enabled(
-                    enabled, getattr(agent, "disabled_toolsets", None), memory_tool_present="memory" in name_set):
+            from agent.memory_manager_tools import memory_provider_tools_exposed  # same gate inject_memory_provider_tools uses
+            if memory_provider_tools_exposed(agent):
                 for schema in get_mem_schemas():
                     _add(schema)
     except Exception:

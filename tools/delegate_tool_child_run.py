@@ -1249,7 +1249,12 @@ class _ChildRun:
     def close_resources(self) -> None:
         """Close only after the worker exits; continuation stays blocked through the entire tail."""
         child = self.child
-        _close_child(child, "Failed to close child agent after delegation")
+        # CAFRA 2026-11-19: Run child.close() inside the child's own profile scope so
+        # MemoryManager.on_session_end() / Hindsight shutdown() match caller_scope on
+        # cross-profile (profile_routes) multiplexed delegations instead of being refused.
+        from tools.delegate_tool_routes import child_profile_scope
+        with child_profile_scope(child):
+            _close_child(child, "Failed to close child agent after delegation")
         # The child's execute_code kernels live exactly as long as the child (pinned against the LRU
         # cap while it runs); dispose them here so they never squat the cap after the child is gone.
         with _quiet("Failed to dispose child execute_code kernels: %s"):
