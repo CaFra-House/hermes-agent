@@ -31,6 +31,7 @@ from tools.delegate_tool_child_run import (
 )
 from tools.delegate_tool_config import (
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_max_concurrent_children,
+    _get_max_concurrent_children_for_depth,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled,
     _inherit_parent_capabilities, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime,
@@ -298,6 +299,10 @@ def _build_child_agent(
         from agent.conversation_compression_checkpoint import checkpoint_required_from_config
 
         child_checkpoint_required = checkpoint_required_from_config()
+        # CAFRA 2026-11-19: Subagents inherit the external memory provider (Hindsight) by default
+        # via delegation.inherit_memory (true) — full auto_recall, auto_retain, hindsight_* tools &
+        # clean session-end flush — while MEMORY.md/USER.md remain disabled via memory_agent_context="subagent".
+        _inherit_memory = bool(delegation_cfg.get("inherit_memory", True))
         with delegated_child_context():
             try:
                 child = AIAgent(
@@ -305,8 +310,8 @@ def _build_child_agent(
                     enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
                     ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
                     side_agent=True,
-                    skip_context_files=True, skip_memory=not child_checkpoint_required,
-                    memory_agent_context="subagent", clarify_callback=None,
+                    skip_context_files=True, skip_memory=not (child_checkpoint_required or _inherit_memory),
+                    memory_agent_context="subagent", inherit_memory_hooks=_inherit_memory, clarify_callback=None,
                     thinking_callback=(
                         (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                         if child_progress_cb else None
@@ -647,7 +652,7 @@ def delegate_task(
             "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    max_children = _get_max_concurrent_children()
+    max_children = _get_max_concurrent_children_for_depth(depth)
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)

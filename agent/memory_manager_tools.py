@@ -54,9 +54,13 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     Same gate as ``inject_memory_provider_tools`` so a provider's ``system_prompt_block()``
     never advertises tools absent from the tool surface.
     """
+    enabled, disabled = getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
+    if getattr(agent, "inherit_memory_hooks", False):
+        # CAFRA 2026-11-19: Delegated subagents block built-in 'memory' (MEMORY.md/USER.md) via
+        # disabled_toolsets, while intentionally exposing external memory provider tools (Hindsight).
+        return not bool(disabled and {"all", "*"}.intersection(disabled))
     tools = getattr(agent, "tools", None)
     present = isinstance(tools, (list, tuple)) and any(_tool_name(t) == "memory" for t in tools)
-    enabled, disabled = getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
     return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
 
 

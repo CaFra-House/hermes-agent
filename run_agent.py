@@ -278,6 +278,7 @@ class AIAgent(
         pass_session_id: bool = False, requested_provider: str | None = None,
         capabilities: dict[str, bool] | None = None, cwd: str | None = None,
         side_agent: bool = False, memory_manager=None, memory_agent_context: str | None = None,
+        inherit_memory_hooks: bool = False,
         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
@@ -885,6 +886,9 @@ class AIAgent(
             return
         self._memory_provider_shutdown = True
         if self._memory_manager and self._memory_manager.claim_teardown(session_end=True):
+            # CAFRA 2026-11-19: Drain background sync_all (auto_retain) before on_session_end / shutdown
+            # so 1-turn subagents always enqueue and flush their turn into Hindsight before closing.
+            _quietly(lambda: self._memory_manager.flush_pending(timeout=10.0))
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:

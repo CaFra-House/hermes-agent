@@ -492,7 +492,8 @@ def _dispatch_background(batch: _Batch) -> str:
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
-        parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        parent_session_id=getattr(parent_agent, "session_id", None),
+        max_async_children=_get_max_async_children(depth=getattr(parent_agent, "_delegate_depth", 0)),
     )
 
     units = [replace(unit, refused=[]) for unit in _units_of(batch)]
