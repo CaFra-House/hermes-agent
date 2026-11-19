@@ -41,6 +41,12 @@ LEDGER_FILENAME = "spawn-ledger.json"
 #: Interactive processes (chat, REPLs) are deliberately NOT in this set.
 REAPABLE_PURPOSES = frozenset({"serve", "dashboard", "gateway", "mcp-helper"})
 
+#: Terminal-tool children (foreground ``bash -lic`` commands, background jobs) recorded so the
+#: run they belong to can reap them when the spawning worker dies. Not in REAPABLE_PURPOSES:
+#: a persisted job (persist=True) must survive its owner (#41225) and is only reaped by the
+#: explicit orphan sweeps when it matches a kanban-workspace / pytest pattern.
+TERMINAL_CHILD_PURPOSE = "terminal-child"
+
 #: Host-role owners a fresh backend may reap on a HELD_BY_OTHER conflict (#121964): the
 #: serve/dashboard/gateway subset. The mcp-helper rung stays owned by reap_orphaned_mcp_helpers.
 _BACKEND_OWNER_PURPOSES = REAPABLE_PURPOSES - {"mcp-helper"}
@@ -256,10 +262,24 @@ class LedgerEntry:
     boot_start: Optional[float] = None
     spawner_boot: Optional[float] = None
     boot_id: Optional[str] = None
+    # Terminal-tool children (purpose == TERMINAL_CHILD_PURPOSE): the process group the child
+    # leads (it is spawned setsid, so the group survives the child's own exit when background
+    # grandchildren remain), the working directory (the orphan sweeper's pattern anchor), and
+    # whether the job was explicitly persisted (persist_on_release survives owner death — #41225).
+    # Readers must use .get(): older ledger files predate these fields.
+    cwd: str = ""
+    pgid: Optional[int] = None
+    persist: bool = False
 
 
 def _ledger_path() -> Path:
-    """Machine-root ledger path (shared by every profile of this install)."""
+    """Machine-root ledger path (shared by every profile of this install).
+
+    ``HERMES_SPAWN_LEDGER`` overrides for tests (the override must survive into spawned stub
+    processes, so it is env-based rather than a monkeypatch)."""
+    override = os.environ.get("HERMES_SPAWN_LEDGER", "").strip()
+    if override:
+        return Path(override)
     try:
         from hermes_constants import get_default_hermes_root
 
@@ -463,6 +483,42 @@ _LEDGER_LOCK_TIMEOUT_S = 2.0
 _ledger_lock_warned = False
 
 
+def _entry_group_alive(entry: dict) -> bool:
+    """True when a dead-pid terminal-child entry's recorded process GROUP still has members.
+
+    ``bash -lic 'set +m; long_job &'`` exits at once and the job is reparented to init inside the
+    bash's group: the entry's pid is dead but its group is exactly what a reaper must still signal.
+    A recycled PGID is guarded at kill time by ``_leader_is_ours``; retaining one stale entry is
+    harmless (the sweep drops it once the group is gone or the entry ages out).
+    """
+    if entry.get("purpose") != TERMINAL_CHILD_PURPOSE:
+        return False
+    pgid = entry.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    if time.time() - float(entry.get("registered_at") or 0) > _TERMINAL_CHILD_RETENTION_SECONDS:
+        return False
+    try:
+        os.killpg(pgid, 0)  # windows-footgun: ok — POSIX process-group alive probe
+        return True
+    except OSError:
+        return False
+
+
+_TERMINAL_CHILD_RETENTION_SECONDS = 48 * 3600.0
+
+
+def _prepare_ledger_parent(path: Path) -> None:
+    """Ensure the ledger's parent exists — the manifest-validated route for the real home,
+    plain mkdir under a ``HERMES_SPAWN_LEDGER`` override (tests must not touch the real home)."""
+    if os.environ.get("HERMES_SPAWN_LEDGER", "").strip():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return
+    from hermes_constants import mkdir_under_hermes_home
+
+    mkdir_under_hermes_home(path.parent)
+
+
 def _append_entry(entry: LedgerEntry) -> bool:
     """Prune dead entries and append ``entry`` — the ONLY ledger write path.
 
@@ -488,17 +544,19 @@ def _append_entry(entry: LedgerEntry) -> bool:
                                "without it, so concurrent Hermes processes may drop each other's rows")
             logger.debug("spawn ledger lock unavailable", exc_info=True)
         entries = _read_ledger_or_quarantine(path) or []
-        # Drop malformed entries, our own stale entry, and provably dead pids.
+        # Drop malformed entries, our own stale entry, and provably dead pids. A dead-pid
+        # terminal-child entry whose process GROUP still has members is kept: its background
+        # grandchildren are exactly what the orphan sweeps must still find (see
+        # _entry_group_alive).
         pruned = [
             e for e in entries
             if isinstance(e.get("pid"), int)
             and e["pid"] != entry.pid
-            and entry_still_running(e)
+            and (entry_still_running(e) or _entry_group_alive(e))
         ]
         pruned.append(asdict(entry))
         try:
-            from hermes_constants import mkdir_under_hermes_home
-            mkdir_under_hermes_home(path.parent)
+            _prepare_ledger_parent(path)
             # argv may carry surrogate-escaped bytes (non-UTF-8 paths); ensure_ascii keeps the
             # utf-8 text handle from raising UnicodeEncodeError (a ValueError, not an OSError).
             atomic_json_write(path, pruned, mode=0o600, ensure_ascii=True)
@@ -508,13 +566,17 @@ def _append_entry(entry: LedgerEntry) -> bool:
             return False
 
 
-def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None) -> bool:
+def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None,
+                   detail: Optional[dict] = None) -> bool:
     """Record a CHILD process this process just spawned. Best-effort.
 
     Mirror of :func:`register_self` for children that cannot register themselves (stdio MCP
     helpers: arbitrary ``npx``/binary servers never import Hermes code). Records the child's
     ``(pid, create_time)`` with THIS process as spawner, so a helper whose spawner is provably gone
     is a reapable orphan and one whose spawner is alive is never reaped.
+
+    ``detail`` may carry the terminal-child launch identity: ``pgid`` (the process group the
+    child leads), ``persist`` (persist_on_release) and ``cwd`` (defaults to the child's own).
     """
     try:
         pid = int(pid)
@@ -528,9 +590,21 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     try:
         import psutil
 
-        entry.argv = " ".join(psutil.Process(pid).cmdline()[:10])
+        proc = psutil.Process(pid)
+        entry.argv = " ".join(proc.cmdline()[:10])
+        entry.cwd = str((detail or {}).get("cwd") or proc.cwd() or "")
     except Exception:
-        pass
+        entry.cwd = str((detail or {}).get("cwd") or "")
+    try:
+        entry.pgid = int((detail or {}).get("pgid")) if (detail or {}).get("pgid") is not None else None
+    except (TypeError, ValueError):
+        entry.pgid = None
+    if entry.pgid is None and pid > 0:
+        try:
+            entry.pgid = os.getpgid(pid)  # windows-footgun: ok — best-effort POSIX identity
+        except OSError:
+            entry.pgid = None
+    entry.persist = bool((detail or {}).get("persist"))
     return _append_entry(entry)
 
 

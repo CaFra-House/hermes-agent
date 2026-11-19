@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, writeFileSync, renameSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -34,8 +34,17 @@ import { createInterface } from 'node:readline/promises';
 import { attachPasskeyFlow, loadPasskeySigner } from './passkey_socket.js';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
+import { createMutedChatsGate } from './muted_gate.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { bridgeAuthProof, createBridgeAuthMiddleware } from './bridge_auth.js';
+import { esOptOutDeterministico } from './optout_gate.js';
+import {
+  parseTakeoverConfig,
+  isTakeoverActive,
+  isTakeoverActiveForTarget,
+  markTakeover,
+  pruneExpiredTakeovers,
+} from './takeover_gate.js';
 import {
   addMentions,
   buildPollPayload,
@@ -45,16 +54,21 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createInboundTextTracker,
   createQuotedMediaCache,
   deliveryStatusEvent,
   extractBridgeEvent,
   getMessageContent,
+  inboundDedupeKey,
+  inboundTextDedupeKey,
   inboundReadReceiptKeys,
   inferMediaType,
+  lidMappingEntry,
   mediaPayloadForFile,
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolveInboundSenderPhone,
   writeJsonLine,
 } from './bridge_helpers.js';
 
@@ -99,6 +113,67 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+
+// ── Handoff humano (takeover) ─────────────────────────────────────────
+// When the owner/co-admin types in a patient chat from their phone, the bot
+// must stop answering in that chat until TTL of owner silence elapses.
+// State persists in SESSION_DIR/takeover.json so it survives bridge restarts.
+const TAKEOVER_CFG = parseTakeoverConfig(process.env);
+const TAKEOVER_FILE = path.join(SESSION_DIR, 'takeover.json');
+
+// ── Chat silenciado por un humano (muted_chats.json) ──────────────────
+// El gateway descarta los mensajes ENTRANTES de un chat silenciado; esto aplica
+// la misma política a la SALIDA: si el chat está silenciado y la ventana sigue
+// viva, el bridge NO manda y responde {skipped:true, reason:'chat_muted'}.
+const mutedChatsGate = createMutedChatsGate({ sessionDir: SESSION_DIR });
+
+function loadTakeoverState() {
+  try {
+    if (!existsSync(TAKEOVER_FILE)) return {};
+    const raw = JSON.parse(readFileSync(TAKEOVER_FILE, 'utf8'));
+    return pruneExpiredTakeovers(raw, Date.now());
+  } catch {
+    return {};
+  }
+}
+
+let takeoverState = loadTakeoverState();
+
+function persistTakeoverState() {
+  try {
+    takeoverState = pruneExpiredTakeovers(takeoverState, Date.now());
+    writeFileSync(`${TAKEOVER_FILE}.tmp`, JSON.stringify(takeoverState, null, 2));
+    renameSync(`${TAKEOVER_FILE}.tmp`, TAKEOVER_FILE);
+  } catch (err) {
+    console.warn('[bridge] takeover persist failed:', err.message);
+  }
+}
+
+/** Every jid that identifies the same person (phone <-> lid) in this chat. */
+function takeoverAliases(jid) {
+  const out = new Set();
+  const raw = String(jid || '');
+  out.add(raw);
+  out.add(raw.replace(/@.*/, '').replace(/:.*$/, ''));
+  const num = raw.replace(/@.*/, '').replace(/:.*$/, '');
+  // lid -> phone
+  const mapped = (lidToPhone || {})[num];
+  if (mapped) out.add(String(mapped).replace(/\D/g, ''));
+  // phone -> lid (reverse index)
+  for (const [lid, phone] of Object.entries(lidToPhone || {})) {
+    if (String(phone).replace(/\D/g, '') === num) {
+      out.add(lid);
+      out.add(`${lid}@lid`);
+    }
+  }
+  return out;
+}
+
+function isUnderOwnerTakeover(chatId) {
+  if (!TAKEOVER_CFG.enabled) return false;
+  return isTakeoverActiveForTarget(takeoverState, chatId, Date.now(), takeoverAliases);
+}
+
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -252,6 +327,61 @@ function redactWhatsAppId(value) {
   return `${suffix ? `…${suffix}` : '…'}${domainPart ? `@${domainPart}` : ''}`;
 }
 
+// ── Interceptor determinístico de BAJA (opt-out) ──────────────────────
+// Un pedido de baja de comunicaciones no llega al LLM: se responde con texto
+// fijo, se avisa al backend (best-effort) y el evento NO entra a messageQueue.
+// Clasificador: ./optout_gate.js. Spec: PLANO-MOTOR-REACTIVACION §5.2.
+const OPTOUT_RESPUESTA_FIJA =
+  'Listo, no te escribimos más. Si algún día necesitás algo, escribinos vos.';
+const OPTOUT_EVENTO_URL = process.env.HERMES_OPTOUT_EVENTO_URL
+  || 'http://127.0.0.1:8000/api/bot/reactivacion/evento-entrante/';
+const OPTOUT_EVENTO_TIMEOUT_MS = 3000;
+
+function maskOptOutPhone(telefono) {
+  const digits = String(telefono || '').replace(/\D/g, '');
+  return digits ? `…${digits.slice(-4)}` : '(sin numero)';
+}
+
+// Fire-and-forget: la respuesta fija ya salió; si el endpoint no existe todavía
+// (404 hoy) o el backend está caído, se loguea y el bridge sigue vivo.
+function notificarOptOutBackend({ telefono, texto, messageId }) {
+  if (!telefono) {
+    console.warn('[bridge] optout_backend_omitido motivo=telefono_no_resuelto');
+    return;
+  }
+  const apiKey = process.env.ADEN_BOT_API_KEY || '';
+  if (!apiKey) {
+    console.warn('[bridge] optout_backend_omitido motivo=falta_ADEN_BOT_API_KEY');
+    return;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OPTOUT_EVENTO_TIMEOUT_MS);
+  fetch(OPTOUT_EVENTO_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      telefono,
+      texto,
+      es_baja_deterministica: true,
+      message_id_entrante: messageId || '',
+    }),
+    redirect: 'manual',
+    signal: controller.signal,
+  })
+    .then(res => {
+      if (!res.ok) {
+        console.warn(`[bridge] optout_backend_http telefono=${maskOptOutPhone(telefono)} status=${res.status}`);
+      }
+    })
+    .catch(err => {
+      console.warn(`[bridge] optout_backend_error telefono=${maskOptOutPhone(telefono)}:`, err.message);
+    })
+    .finally(() => clearTimeout(timer));
+}
+
 function emitDebugEvent(payload) {
   if (!WHATSAPP_DEBUG) return;
   try {
@@ -261,16 +391,17 @@ function emitDebugEvent(payload) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
-// Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
+// Build LID → phone reverse map from session files.  Baileys writes both
+// `lid-mapping-<phone>.json` (contents = LID) and, for first contacts that only
+// arrived by LID, `lid-mapping-<lid>_reverse.json` (contents = phone); reading
+// only the first shape left real senders unresolved.
 function buildLidMap() {
   const map = {};
   try {
     for (const f of readdirSync(SESSION_DIR)) {
-      const m = f.match(/^lid-mapping-(\d+)\.json$/);
-      if (!m) continue;
-      const phone = m[1];
-      const lid = JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8'));
-      if (lid) map[String(lid)] = phone;
+      if (!/^lid-mapping-\d+(_reverse)?\.json$/.test(f)) continue;
+      const entry = lidMappingEntry(f, JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8')));
+      if (entry) map[entry[0]] = entry[1];
     }
   } catch {}
   return map;
@@ -292,6 +423,22 @@ const MAX_QUEUE_SIZE = 100;
 // sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
+// Inbound de-duplication.  Baileys can emit the same incoming message twice
+// ('append' then 'notify', or a retransmission after a lost ack).  Each copy
+// used to be queued and reached Python as its own MessageEvent, so the agent
+// ran one turn per copy and answered the customer twice.  Remember
+// "chatId:messageId" and drop the repeat before it reaches the queue.
+const recentlyProcessedInbound = createOutboundIdTracker(1024);
+// Second inbound guard, by CONTENT.  WhatsApp retransmits the same customer
+// send ~2 s later under a different message id and a different native type
+// ('conversation' vs 'extendedTextMessage'), so the id tracker above cannot
+// see that pair.  Same chat + same normalized text inside 6 s is one message;
+// media and empty bodies are never keyed.
+const INBOUND_TEXT_DEDUPE_WINDOW_MS = 6000;
+const recentlyProcessedInboundText = createInboundTextTracker({
+  windowMs: INBOUND_TEXT_DEDUPE_WINDOW_MS,
+  maxSize: 1024,
+});
 const messageStore = createBoundedMessageStore(512);
 // Bounded cache of already-downloaded inbound media, so a later reply to an
 // uncaptioned photo/video/document/voice note can still surface the original
@@ -619,6 +766,24 @@ async function startSocket() {
       const resolvedSenderId = senderAltId.endsWith('@s.whatsapp.net') ? senderAltId : senderId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = resolvedSenderId.replace(/@.*/, '');
+      // Real phone of a DM sender: the phone twin Baileys puts on the envelope,
+      // else the session's LID→phone map.  Empty for groups, fromMe and LIDs
+      // with no mapping — the adapter only prefixes when this is present.
+      const resolvePhone = () => resolveInboundSenderPhone({
+        chatId,
+        senderAltId,
+        lidToPhone,
+        isGroup,
+        fromMe: !!msg.key.fromMe,
+      });
+      let senderPhone = resolvePhone();
+      // A first contact's mapping file can land after the last creds.update, and
+      // the in-memory map would then miss it for the life of the process.  One
+      // refresh per unresolved LID is cheap next to losing the patient's phone.
+      if (!senderPhone && !isGroup && !msg.key.fromMe && chatId.endsWith('@lid')) {
+        lidToPhone = buildLidMap();
+        senderPhone = resolvePhone();
+      }
       emitDebugEvent({
         stage: 'upsert',
         type,
@@ -674,6 +839,24 @@ async function startSocket() {
             continue;
           }
           fromOwner = true;
+          // Handoff humano: el dueño/co-admin escribió desde su teléfono en
+          // este chat → el bot se calla acá por TTL rodante (2 h por defecto).
+          // Sin esto el bot sigue contestando y pisa la indicación clínica.
+          if (TAKEOVER_CFG.enabled) {
+            takeoverState = markTakeover(
+              takeoverState,
+              chatId,
+              Date.now(),
+              TAKEOVER_CFG.ttlMs,
+              '',
+            );
+            persistTakeoverState();
+            emitDebugEvent({
+              stage: 'owner_takeover',
+              chatId: redactWhatsAppId(chatId),
+              ttlHours: TAKEOVER_CFG.ttlMs / 3600_000,
+            });
+          }
         } else {
           // Self-chat mode: only allow messages in the user's own self-chat.
           // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
@@ -804,6 +987,28 @@ async function startSocket() {
         continue;
       }
 
+      // Drop a repeat of an already-processed inbound message.  Baileys
+      // delivers the same message under both 'append' and 'notify' (and
+      // retransmits when an ack is lost); before this guard each copy became
+      // its own MessageEvent and the agent ran one turn per copy, answering
+      // the customer twice.  Keyed by chat + message id, so identical text
+      // sent twice by the customer (different ids) is never dropped.
+      // fromMe messages keep their own echo/owner handling above, and poll
+      // updates returned before this point.
+      const inboundKey = inboundDedupeKey({ chatId, messageId: msg.key.id, fromMe: !!msg.key.fromMe });
+      if (inboundKey) {
+        if (recentlyProcessedInbound.has(inboundKey)) {
+          emitDebugEvent({
+            stage: 'ignored',
+            reason: 'duplicate_inbound',
+            chatId: redactWhatsAppId(chatId),
+            messageId: msg.key.id,
+          });
+          continue;
+        }
+        recentlyProcessedInbound.remember(inboundKey);
+      }
+
       const event = await extractBridgeEvent({
         msg,
         chatId,
@@ -820,6 +1025,7 @@ async function startSocket() {
         lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
+      event.senderPhone = senderPhone;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -831,6 +1037,18 @@ async function startSocket() {
             messageId: msg.key.id,
           });
         }
+        continue;
+      }
+
+      // Una reacción NO es una pregunta: el bot la registra pero no contesta.
+      // Antes generaba una respuesta por cada emoji (4 respuestas a 3
+      // reacciones en el caso Fran), puro ruido en el chat del paciente.
+      if (event.nativeType === 'reactionMessage') {
+        emitDebugEvent({
+          stage: 'ignored',
+          reason: 'reaction_no_reply',
+          chatId: redactWhatsAppId(chatId),
+        });
         continue;
       }
 
@@ -846,6 +1064,33 @@ async function startSocket() {
         continue;
       }
 
+      // Second layer: the same customer text re-delivered with a DIFFERENT
+      // message id ('conversation' vs 'extendedTextMessage', ~2 s apart) is
+      // invisible to the id guard above.  Keyed by chat + normalized text in a
+      // 6 s window, before anything is queued or remembered.  Media, empty
+      // bodies and fromMe events are never keyed, so attachments always pass.
+      const inboundTextKey = inboundTextDedupeKey({
+        chatId,
+        body: event.body,
+        hasMedia: event.hasMedia,
+        mediaType: event.mediaType,
+        mediaUrls: event.mediaUrls,
+        quotedMediaUrls: event.quotedMediaUrls,
+      });
+      if (inboundTextKey) {
+        if (recentlyProcessedInboundText.has(inboundTextKey)) {
+          emitDebugEvent({
+            stage: 'ignored',
+            reason: 'duplicate_inbound_text',
+            chatId: redactWhatsAppId(chatId),
+            messageId: msg.key.id,
+            bodyLength: event.body.length,
+          });
+          continue;
+        }
+        recentlyProcessedInboundText.remember(inboundTextKey);
+      }
+
       messageStore.remember(msg);
       // Remember this message's already-downloaded media/text so a later
       // reply to it (even uncaptioned media) can resolve the original
@@ -856,6 +1101,38 @@ async function startSocket() {
         mediaType: event.mediaType,
         mediaUrls: event.mediaUrls,
       });
+
+      // ── Interceptor determinístico de BAJA ───────────────────────────
+      // Antes de encolar al LLM: una baja inequívoca no consume un token ni
+      // pasa por Enua. Se responde el texto fijo y se persiste el opt-out por
+      // HTTP (best-effort). Grupos y mensajes del dueño quedan fuera: ahí no
+      // hay un paciente que pueda darse de baja.
+      if (!isGroup && !msg.key.fromMe && !event.fromOwner && esOptOutDeterministico(event.body)) {
+        // Solo un teléfono real sirve para persistir el opt-out: si el chat
+        // llegó por LID y no hay mapeo, no se inventa un número.
+        const telefonoOptOut = senderPhone
+          || (String(chatId || '').endsWith('@s.whatsapp.net')
+            ? String(chatId).replace(/@.*/, '').replace(/\D/g, '')
+            : '');
+        console.log(`[bridge] optout_interceptado telefono=${maskOptOutPhone(telefonoOptOut)}`);
+        notificarOptOutBackend({
+          telefono: telefonoOptOut,
+          texto: event.body,
+          messageId: msg.key.id,
+        });
+        try {
+          await sendWithTimeout(chatId, { text: OPTOUT_RESPUESTA_FIJA });
+        } catch (err) {
+          console.warn('[bridge] optout_respuesta_fija_error:', err.message);
+        }
+        emitDebugEvent({
+          stage: 'optout_interceptado',
+          chatId: redactWhatsAppId(chatId),
+          messageId: msg.key.id,
+        });
+        continue;
+      }
+
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',
@@ -943,6 +1220,19 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  // Handoff humano activo en este chat → no mandamos nada. El humano es
+  // dueño de la conversación hasta que venza el TTL.
+  if (isUnderOwnerTakeover(chatId)) {
+    return res.json({ success: true, skipped: true, reason: 'takeover' });
+  }
+
+  // Chat silenciado por un humano (muted_chats.json) → no sale nada.
+  const mutedHit = mutedChatsGate.isMuted(chatId, takeoverAliases);
+  if (mutedHit) {
+    console.warn(`[bridge] envío bloqueado: chat silenciado (${mutedHit.reason || 'sin motivo'})`);
+    return res.json({ success: true, skipped: true, reason: 'chat_muted' });
+  }
+
   try {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
@@ -1015,6 +1305,18 @@ app.post('/send-media', async (req, res) => {
   const { chatId, filePath, mediaType, caption, fileName, mentions } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  // Handoff humano activo → no mandamos adjuntos tampoco.
+  if (isUnderOwnerTakeover(chatId)) {
+    return res.json({ success: true, skipped: true, reason: 'takeover' });
+  }
+
+  // Chat silenciado por un humano (muted_chats.json) → no sale nada.
+  const mutedHit = mutedChatsGate.isMuted(chatId, takeoverAliases);
+  if (mutedHit) {
+    console.warn(`[bridge] envío bloqueado: chat silenciado (${mutedHit.reason || 'sin motivo'})`);
+    return res.json({ success: true, skipped: true, reason: 'chat_muted' });
   }
 
   try {
@@ -1119,6 +1421,9 @@ app.post('/send-poll', async (req, res) => {
   if (!chatId || !question || !Array.isArray(options)) {
     return res.status(400).json({ error: 'chatId, question, and options are required' });
   }
+  if (mutedChatsGate.isMuted(chatId, takeoverAliases)) {
+    return res.json({ success: true, skipped: true, reason: 'chat_muted' });
+  }
 
   try {
     const payload = buildPollPayload({ question, options, selectableCount });
@@ -1140,6 +1445,9 @@ app.post('/send-location', async (req, res) => {
   const { chatId, latitude, longitude, name, address } = req.body;
   if (!chatId || latitude === undefined || longitude === undefined) {
     return res.status(400).json({ error: 'chatId, latitude, and longitude are required' });
+  }
+  if (mutedChatsGate.isMuted(chatId, takeoverAliases)) {
+    return res.json({ success: true, skipped: true, reason: 'chat_muted' });
   }
 
   try {

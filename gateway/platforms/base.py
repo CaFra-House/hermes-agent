@@ -18,6 +18,8 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Optional
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import _log_safe_path, describe_proxy_error, env_proxy_for_redaction, safe_proxy_url_for_log, safe_url_for_log
 from gateway.platforms.base_image_sniff import _looks_like_image
@@ -56,6 +58,33 @@ _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 # Telegram sendAudio accepts only MP3 / M4A; others go via sendVoice (Opus/OGG) or as a document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+
+
+def _human_delay_window_for_current_hour(schedule) -> Optional[tuple[int, int]]:
+    """``(lo_ms, hi_ms)`` of the first ``human_delay.schedule`` entry covering the current LOCAL
+    hour, or ``None``. ``from_hour > to_hour`` is a window that wraps past midnight (``20 -> 8``);
+    ``from_hour == to_hour`` covers the whole day. On overlap the first listed entry wins, and a
+    malformed entry is skipped rather than raising at send time."""
+    if not schedule:
+        return None
+    hour = datetime.now().hour
+    for slot in schedule:
+        try:
+            start = int(slot["from_hour"])
+            end = int(slot["to_hour"])
+            lo = int(slot["min_ms"])
+            hi = int(slot["max_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start == end:
+            hit = True
+        elif start < end:
+            hit = start <= hour < end
+        else:
+            hit = hour >= start or hour < end
+        if hit:
+            return (lo, hi) if lo <= hi else (hi, lo)
+    return None
 
 
 def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
@@ -1865,8 +1894,10 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self._busy_text_debounce_seconds: float = DEFAULT_BUSY_TEXT_DEBOUNCE_SECONDS
         self._busy_text_hard_cap_seconds: float = DEFAULT_BUSY_TEXT_HARD_CAP_SECONDS
         # ``human_delay`` pacing range in ms, or None (off); per-profile config installed by the
-        # runner, never process env (#116895).
+        # runner, never process env (#116895). ``_human_delay_schedule`` holds the optional hourly
+        # windows (``human_delay.schedule``) that override the range for the current local hour.
         self._human_delay_range_ms: Optional[tuple[int, int]] = None
+        self._human_delay_schedule: Optional[list[dict]] = None
         self._text_debounce: dict[str, TextDebounceState] = {}
         # handle_message() tasks; shutdown cancels them so a replaced gateway stops working.
         self._background_tasks: set[asyncio.Task] = set()
@@ -2397,9 +2428,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     # split (Telegram's measured envelope), short enough that a single short message is not
     # visibly delayed (#44883). Ceilings bound a misconfigured value fed to asyncio.sleep().
     _TEXT_BATCH_DEFAULT_DELAY_S: float = 0.3
-    _TEXT_BATCH_MAX_DELAY_S: float = 2.0
+    _TEXT_BATCH_MAX_DELAY_S: float = 30.0
     _TEXT_BATCH_DEFAULT_SPLIT_DELAY_S: float = 1.0
-    _TEXT_BATCH_MAX_SPLIT_DELAY_S: float = 4.0
+    _TEXT_BATCH_MAX_SPLIT_DELAY_S: float = 40.0
 
     def _coerce_float_extra(self, key: str, default: float, *, min_value: float = 0.0, max_value: Optional[float] = None) -> float:
         """Float from ``config.extra``; NaN/Inf/negative/unparseable → ``default``; clamped to ``[min_value, max_value]``."""
@@ -3803,12 +3834,31 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        task = asyncio.create_task(self._process_message_paced(event, session_key))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
         return True
+
+    async def _process_message_paced(self, event: MessageEvent, session_key: str) -> None:
+        """Human pacing gate: hold the turn for the configured delay before the agent runs.
+
+        Delaying here (under the session guard, so a second message can't race in) is what the
+        patient actually perceives as response latency — the per-attachment ``human_delay`` only
+        paces outbound images. Slash commands skip the wait.
+        """
+        await self._await_human_pace(event, session_key)
+        await self._process_message_background(event, session_key)
+
+    async def _await_human_pace(self, event: MessageEvent, session_key: str) -> None:
+        if getattr(event, "get_command", None) and event.get_command():
+            return
+        delay = self._get_human_delay()
+        if delay > 0:
+            logger.info("[%s] Human pacing %.1fs before replying in %s",
+                        self.name, delay, session_key)
+            await asyncio.sleep(delay)
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
         """Record ``task`` as the session owner and track it for shutdown; False when
@@ -3885,6 +3935,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
+            return
+        if self._chat_muted_by_human(event):
+            logger.info(
+                "[%s] Chat %s is under human takeover (muted_chats.json); dropping inbound message",
+                self.name, event.source.chat_id)
             return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
@@ -4028,10 +4083,108 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                                         merge_text=event.message_type == MessageType.TEXT)
             event._gateway_accepted = True
 
+    # ── Human takeover (muted chats) ────────────────────────────────────
+    # ``<HERMES_HOME>/muted_chats.json`` maps a chat id to ``{"until": <epoch>, "reason": ...}``.
+    # While the entry is live the adapter drops that chat's inbound messages, so the bot stays
+    # silent while a human answers by hand. Written by ``~/.hermes/scripts/bot-mute-chat.py``.
+    _MUTED_CHATS_FILENAME = "muted_chats.json"
+
+    def _muted_chats_state(self) -> dict:
+        """Parsed ``muted_chats.json``, cached by mtime; ``{}`` when absent or unreadable."""
+        import json
+        import os
+        from pathlib import Path
+
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        path = Path(home) / self._MUTED_CHATS_FILENAME
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            self._muted_chats_cache = ({}, None)
+            return {}
+        cached = getattr(self, "_muted_chats_cache", None)
+        if cached and cached[1] == mtime:
+            return cached[0]
+        try:
+            data = json.loads(path.read_text() or "{}")
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            logger.warning("[%s] muted_chats.json unreadable; treating as empty", self.name)
+            data = {}
+        self._muted_chats_cache = (data, mtime)
+        return data
+
+    def _chat_muted_by_human(self, event: MessageEvent) -> bool:
+        """True when a live takeover entry covers this event's chat.
+
+        Matching is threefold: (a) the literal chat id, (b) the digits before ``@``
+        on either side, and (c) every value of the entry's optional ``aliases``
+        list. The digits arm exists because WhatsApp/Baileys changes the suffix
+        (``@s.whatsapp.net``, ``@c.us``, ``@lid``) for the same contact.
+
+        LIMITACIÓN LID: un ``@lid`` y un ``@s.whatsapp.net`` del MISMO contacto
+        son identificadores distintos y los dígitos del LID no son el teléfono,
+        así que la normalización por dígitos no los une. Para ese caso el
+        operador debe mutear con ``bot-mute-chat.py mute ... --alias <el otro id>``.
+        """
+        import time
+
+        state = self._muted_chats_state()
+        if not state:
+            return False
+        raw_candidates = {str(event.source.chat_id or "")}
+        metadata = event.metadata or {}
+        for key in ("whatsapp_chat_id", "whatsapp_jid", "whatsapp_remote_jid"):
+            value = metadata.get(key)
+            if value:
+                raw_candidates.add(str(value))
+        candidates = {value for value in raw_candidates if value}
+        candidate_digits = {
+            digits for digits in (self._chat_id_digits(value) for value in candidates) if digits
+        }
+        now = time.time()
+        for chat_id, entry in state.items():
+            until = entry.get("until") if isinstance(entry, dict) else entry
+            try:
+                if float(until) <= now:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            keys = {str(chat_id)}
+            aliases = entry.get("aliases") if isinstance(entry, dict) else None
+            if isinstance(aliases, list):
+                keys |= {str(alias) for alias in aliases if alias}
+            for key in keys:
+                if key in candidates:
+                    return True
+                digits = self._chat_id_digits(key)
+                if digits and digits in candidate_digits:
+                    return True
+        return False
+
+    @staticmethod
+    def _chat_id_digits(value) -> str:
+        """Digits before the ``@`` of a chat id (``""`` when there are none).
+
+        ``5493825669508@s.whatsapp.net`` -> ``5493825669508``;
+        ``252758942826641@lid`` -> ``252758942826641`` (a LID, NOT a phone number).
+        """
+        local = str(value or "").strip().split("@", 1)[0]
+        return "".join(ch for ch in local if ch.isdigit())
+
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range
-        (ms), installed per profile by the runner (``_wire_adapter_handlers``); ``None`` = off."""
+        (ms), installed per profile by the runner (``_wire_adapter_handlers``); ``None`` = off.
+
+        When the profile configures ``human_delay.schedule``, the window containing the current
+        local hour replaces the static range (``20 -> 8`` wraps past midnight; on overlap the first
+        listed window wins). No schedule = the static range, exactly as before.
+        """
         bounds = self._human_delay_range_ms
+        window = _human_delay_window_for_current_hour(getattr(self, "_human_delay_schedule", None))
+        if window is not None:
+            bounds = window
         if not bounds:
             return 0.0
         lo, hi = bounds

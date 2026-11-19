@@ -1406,8 +1406,15 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         timing = busy_text_timing or getattr(self, "_busy_text_timing", None)
         if timing:
             adapter._busy_text_debounce_seconds, adapter._busy_text_hard_cap_seconds = timing
-        adapter._human_delay_range_ms = (
-            getattr(self, "_human_delay", None) if human_delay is _UNSET else human_delay)
+        installed_delay = getattr(self, "_human_delay", None) if human_delay is _UNSET else human_delay
+        # ``_human_delay_from_config`` returns ``(lo_ms, hi_ms, schedule_or_none)``; tolerate a plain
+        # 2-tuple for callers/tests that still install a bare range.
+        if installed_delay and len(installed_delay) >= 3:
+            adapter._human_delay_range_ms = (installed_delay[0], installed_delay[1])
+            adapter._human_delay_schedule = installed_delay[2]
+        else:
+            adapter._human_delay_range_ms = installed_delay
+            adapter._human_delay_schedule = None
 
     def _configure_profile_adapter(
         self, adapter: BasePlatformAdapter, profile_name: str, platform: Platform
