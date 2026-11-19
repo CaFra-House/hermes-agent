@@ -40,7 +40,9 @@ from tools.delegate_tool_config import (
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _build_child_progress_callback,
-    _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
+    _build_child_system_prompt, _clean_error_text, _emit_parent_console,
+    _extract_brief_project_and_path, _format_project_ownership_block,
+    _quiet, _resolve_workspace_hint,
     _safe_progress, format_batch_tag, format_subagent_failure_line,
 )
 from tools.delegate_tool_registry import (
@@ -251,9 +253,14 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = delegate_tool_config._load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    brief_project, brief_ruta = _extract_brief_project_and_path(goal, context)
+    _brief_cwd = brief_ruta if (brief_ruta and Path(brief_ruta).is_dir()) else None
+    effective_workspace = _brief_cwd or _resolve_workspace_hint(parent_agent)
+    ownership_block = _format_project_ownership_block(brief_project, brief_ruta, home=profile_home)
     child_prompt = _build_child_system_prompt(
-        workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        workspace_path=effective_workspace, role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
+        project_ownership_block=ownership_block,
     )
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -320,8 +327,13 @@ def _build_child_agent(
                     session_id=session_id or getattr(child_session_db, "reserved_session_id", None),
                     tool_progress_callback=child_progress_cb,
                     iteration_budget=None,  # fresh budget per subagent
-                    # A profile route carries that profile's identity (its SOUL.md under the bound home).
-                    **({"load_soul_identity": True} if profile_home is not None else {}),
+                    # CAFRA 2026-11-19: Load profile SOUL.md for both cross-profile AND same-profile children
+                    # (opt-out via delegation.inherit_soul: false).
+                    **(
+                        {"load_soul_identity": True}
+                        if (profile_home is not None or bool(delegation_cfg.get("inherit_soul", True)))
+                        else {}
+                    ),
                 )
             except BaseException:
                 # No child close() will ever run: release the dedicated handle here.
@@ -346,6 +358,8 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+    if _brief_cwd:
+        child._delegate_brief_cwd = _brief_cwd
     # Plugins see one conversation per delegation tree.
     from agent.prompt_cache_scope import conversation_id, sibling_cache_scope
     child._inherited_conversation_id = conversation_id(parent_agent)
