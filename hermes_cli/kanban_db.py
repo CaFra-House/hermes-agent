@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import kanban_approval_gate as _approval_gate
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -313,6 +314,36 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
+
+# Worker exit "infrastructure lost the attempt": the gateway died mid-turn (restart, crash) or the
+# worker was recycled because the board's WAL generation was retired underneath it. Nothing about
+# the CARD failed, so the dead-worker sweep releases it to ``ready`` WITHOUT counting a failure and
+# the dispatcher respawns it (a gateway restart must never spend a card's retry budget — two
+# restarts in a row used to flip a card to triage by themselves). 69 == BSD EX_UNAVAILABLE.
+KANBAN_INFRASTRUCTURE_EXIT_CODE = 69
+
+# Run outcome / dead-worker event kind for the exit code above. Neutral in
+# ``_protocol_violation_streak`` like ``rate_limited``: it says nothing about the task.
+KANBAN_INFRASTRUCTURE_OUTCOME = "infrastructure"
+
+# Log-marker fallback for the same classification: a worker killed before it could write its exit
+# trailer still printed the gateway client's disconnect line to its log (the sweep reads that log).
+# Must match the message rendered by ``hermes_cli.gateway_connection.DISCONNECTED`` /
+# ``hermes_cli.gateway_client`` (kept as a literal to avoid importing gateway modules here).
+KANBAN_GATEWAY_DISCONNECT_MARKER = "Gateway disconnected"
+
+# Patch t_718832e6 (2/3): owner-stall literals the worker client AND the dead-worker sweep must
+# book as INFRASTRUCTURE (requeue without spending ``consecutive_failures``). The only marker above
+# matched "Gateway disconnected", but a stalled owner loop answers with these two instead
+# ("no local fallback": gateway_connection.py:187/195/203/231, gateway_client.py:310; "Gateway
+# connection timed out": gateway_connection.py:187/195) — so the t_ec056a29 crashes escaped the
+# fallback, counted failures, and parked cards at failure_limit=2 with nobody waking them.
+# "Kanban execution unknown; retained by owner" is deliberately NOT here and must never be added:
+# there the worker died mid-turn while the owner may still be RUNNING that attempt
+# (``owner_reclaim_paused``) — requeuing would run the card twice in parallel. The same exclusion
+# guards kanban_worker_client._is_infrastructure_loss; this is the spot someone will try to
+# "fix harder".
+KANBAN_OWNER_STALL_MARKERS = ("no local fallback", "Gateway connection timed out")
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1250,6 +1281,13 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # Hard approval gate (incident 31/10, t_fff1ff26): a card whose
+                # title/body carries Julio's approval marker is never born
+                # dispatchable, whatever status was requested. It is parked
+                # `blocked` at birth and only an explicit `unblock` releases it.
+                gate_marker = _approval_gate.marker_hit(title, body)
+                if gate_marker and task_status != "blocked":
+                    task_status = "blocked"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1307,8 +1345,22 @@ def create_task(
                         conn,
                         task_id,
                         "blocked",
-                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                        {
+                            "reason": _approval_gate.GATE_REASON if gate_marker else "initial_status",
+                            "status": "blocked",
+                            "actor": created_by or "user",
+                            **({"marker": gate_marker[:120]} if gate_marker else {}),
+                        },
                     )
+                    if gate_marker:
+                        # The gate comment is the human-facing note (and keeps
+                        # the board's block diagnostics quiet while it waits).
+                        gate_text = _approval_gate.comment_text(gate_marker)
+                        _insert_comment(conn, task_id, _approval_gate.GATE_ACTOR, gate_text, now)
+                        _append_event(
+                            conn, task_id, "commented",
+                            {"author": _approval_gate.GATE_ACTOR, "len": len(gate_text)},
+                        )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
                     # link_tasks does, so the board never shows an unexplained todo.
@@ -2050,12 +2102,20 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, title, body "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            gate_marker = _approval_gate.gate_active(
+                conn, task_id, title=row["title"], body=row["body"])
+            if gate_marker:
+                # Approval gate: a marked card is never promoted to `ready`;
+                # park it (sticky) so the board shows it waiting on the human.
+                # Idempotent — repeat ticks do not duplicate the gate event.
+                _approval_gate.park(conn, task_id, gate_marker)
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2181,6 +2241,21 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Approval gate: a card carrying Julio's marker is never handed to a
+        # worker. Park it so the dispatcher stops retrying it; `unblock` (an
+        # explicit operator action) is the only release.
+        gate_marker = _approval_gate.gate_active(conn, task_id)
+        if gate_marker:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": _approval_gate.GATE_REASON, "marker": gate_marker[:120]},
+            )
+            _approval_gate.park(conn, task_id, gate_marker)
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -3492,6 +3567,16 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    gate_marker = _approval_gate.gate_active(conn, task_id)
+    if gate_marker:
+        # Approval gate: manual promotion is not the approval valve — an
+        # explicit `unblock` is. Without this, `promote` would bypass the gate.
+        return False, (
+            f"task {task_id} carries the approval marker {gate_marker!r} — it is "
+            f"gated on Julio's decision; release it with "
+            f"`hermes kanban unblock {task_id}` once approved"
+        )
+
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
@@ -3746,6 +3831,12 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # Approval gate: the specifier never promotes a marked card. Callers
+        # park it (`kanban_approval_gate.park`); refusing here also covers
+        # direct DB callers (dashboard, scripts) that skip that layer.
+        if _approval_gate.gate_active(
+                conn, task_id, title=existing["title"], body=existing["body"]):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []

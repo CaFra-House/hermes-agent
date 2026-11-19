@@ -5,6 +5,8 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+from hermes_cli import kanban_approval_gate as _approval_gate
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,
@@ -115,10 +117,16 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, title, body "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        # Approval gate: a markered root is never fanned out (children would be
+        # dispatched as real work). Callers park it; refusing here also covers
+        # direct DB callers.
+        if _approval_gate.gate_active(
+                conn, task_id, title=root_row["title"], body=root_row["body"]):
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.

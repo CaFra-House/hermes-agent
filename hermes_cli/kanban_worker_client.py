@@ -164,12 +164,48 @@ def main():
     # The dead-worker sweep books this process's exit from the trailer in its log (it never
     # reaps us), so every exit path writes it — the same contract as a quiet one-shot worker.
     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+    from hermes_cli import kanban_db as _kb
     rc = 1
     try:
         rc = _submit()
+    except Exception as exc:
+        if _is_infrastructure_loss(exc):
+            # The gateway died/restarted mid-turn (or its owner stayed unavailable through
+            # an update window): nothing about the CARD failed. Exit with the infrastructure
+            # code so the sweep requeues the card without counting a failure — two gateway
+            # restarts in a row must never flip a card to triage by themselves
+            # (2026-10-31, t_08acf863).
+            print(f'Kanban infrastructure loss: {exc}', file=sys.stderr)
+            rc = _kb.KANBAN_INFRASTRUCTURE_EXIT_CODE
+        else:
+            raise
     finally:
         print(f'\n{KANBAN_WORKER_EXIT_TRAILER}{int(rc)}', file=sys.stderr, flush=True)
     return rc
+
+
+def _is_infrastructure_loss(exc: Exception) -> bool:
+    """True for a gateway-lifecycle loss (disconnect / unavailable owner), not for a
+    card's own failure. ``Kanban execution unknown; retained by owner`` stays excluded:
+    the owner may still be running that attempt (``owner_reclaim_paused`` governs it).
+    ``kanban_db.KANBAN_OWNER_STALL_MARKERS`` ("no local fallback", "Gateway connection
+    timed out") are the two owner-loop stall signatures from t_ec056a29 that the old
+    classifier never recognized; "retained by owner" must NOT join them (double-run risk,
+    see the comment at that constant)."""
+    from hermes_cli import kanban_db as _kb
+    try:
+        from hermes_cli.gateway_client import GatewayClientError, GatewayUnavailableError
+    except ImportError:
+        return False
+    if isinstance(exc, GatewayUnavailableError):
+        return True
+    if not isinstance(exc, GatewayClientError):
+        return False
+    msg = str(exc)
+    return (
+        _kb.KANBAN_GATEWAY_DISCONNECT_MARKER in msg
+        or any(marker in msg for marker in _kb.KANBAN_OWNER_STALL_MARKERS)
+    )
 
 
 def _submit():

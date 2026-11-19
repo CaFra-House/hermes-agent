@@ -133,8 +133,18 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError as rules_exc:
+            # LOCAL PATCH (CaFra, t_955bea97): rulesets — like branch protection — are
+            # a Pro-plan feature for private repos; GitHub answers 403 "Upgrade to
+            # GitHub Pro" permanently, independent of credentials. The GraphQL
+            # branchProtectionRule read above is the only protection source this plan
+            # can offer; keep collecting instead of failing the whole card.
+            if "HTTP 403" not in str(rules_exc):
+                raise
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -142,7 +152,38 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            if pr["state"] != "MERGED":
+                receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+                return receipt
+            # LOCAL PATCH (CaFra): a free-plan private repo can never expose required
+            # checks (both protection APIs are Pro-only), so the strongest acceptance
+            # evidence GitHub gives is: the PR is MERGED (GraphQL now, REST re-check
+            # below) and every CI check that ran on that exact head went green.
+            # Anything less still falls back to the local-only contract.
+            pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+                         paginate=True, profile_home=profile_home)
+            runs = [run for page in pages for run in page["check_runs"]]
+            if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+                raise ValueError("Incomplete check-run pagination")
+            outcomes = []
+            for run in sorted(runs, key=lambda r: str(r["name"])):
+                outcome = run.get("conclusion")
+                classification = _classify(run, sha, outcome, True)
+                outcomes.append("success" if classification == "success" or outcome in {"skipped", "neutral"}
+                                else classification)
+                receipt["checks"].append({"name": run["name"], "id": run["id"],
+                    "url": run.get("html_url") or run.get("target_url"),
+                    "head_sha": run.get("head_sha", sha),
+                    "classification": classification, "conclusion": outcome})
+            current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+            if current["head"]["sha"] != sha or current["state"] != "closed" or not current.get("merged"):
+                receipt.update(classification="stale", detail="PR head/state changed while collecting evidence; retry.")
+                return receipt
+            receipt["classification"] = next((x for x in outcomes if x != "success"), "success")
+            receipt["ok"] = receipt["classification"] == "success"
+            receipt["detail"] = ("Merged-PR fallback (free plan cannot read required checks): "
+                                 "PR merged with all head-SHA CI checks green." if receipt["ok"]
+                                 else f"Merged-PR fallback blocked: a head-SHA check is {receipt['classification']}.")
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)

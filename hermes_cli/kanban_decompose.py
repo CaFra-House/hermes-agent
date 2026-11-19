@@ -27,7 +27,8 @@ from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
-    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _call_aux, _extract_json_blob, _load_triage_task, _park_if_gated, _task_prompt_fields,
+    _title_body,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -312,6 +313,17 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    gate_marker = _park_if_gated(task_id)
+    if gate_marker:
+        # Hard approval gate: never spend the decomposer LLM on a card that
+        # needs Julio's decision, and never fan it out into dispatchable
+        # children. Parked `blocked`; `hermes kanban unblock` is the release.
+        return DecomposeOutcome(
+            task_id, False,
+            f"approval gate: body carries {gate_marker!r} — card parked as blocked "
+            f"until `hermes kanban unblock {task_id}`",
+        )
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

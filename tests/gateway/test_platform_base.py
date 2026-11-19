@@ -1267,7 +1267,14 @@ class TestGetHumanDelay:
     def test_config_bounds_are_validated_with_a_warning_naming_the_key(self, cfg, expected, warned_key, caplog):
         from gateway.run import GatewayRunner
         with caplog.at_level(logging.WARNING, logger="gateway.run"):
-            assert GatewayRunner._human_delay_from_config(cfg) == expected
+            result = GatewayRunner._human_delay_from_config(cfg)
+        # ``(lo_ms, hi_ms, schedule_or_none)``; none of these configs sets a schedule.
+        if expected is None:
+            assert result is None
+        else:
+            lo, hi, schedule = result
+            assert (lo, hi) == expected
+            assert schedule is None
         if warned_key is None:
             assert "human_delay" not in caplog.text
         else:

@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from hermes_cli import kanban_approval_gate as _approval_gate
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
@@ -134,6 +135,20 @@ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
     return task, ""
 
 
+def _park_if_gated(task_id: str) -> Optional[str]:
+    """Park a card carrying Julio's approval marker as ``blocked``.
+
+    Returns the matched marker (``None`` when the card is clear). Runs BEFORE the
+    auxiliary LLM call so a gated card never spends a spec call, and parks it so
+    the triage sweep stops re-selecting it every tick.
+    """
+    with kbc.connect_closing() as conn:
+        marker = _approval_gate.gate_active(conn, task_id)
+        if marker:
+            _approval_gate.park(conn, task_id, marker)
+    return marker
+
+
 def _task_prompt_fields(task: kb.Task) -> dict[str, str]:
     """Bounded ``task_id``/``title``/``body`` for the user prompt templates."""
     return {
@@ -199,6 +214,14 @@ def specify_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+
+    gate_marker = _park_if_gated(task_id)
+    if gate_marker:
+        return SpecifyOutcome(
+            task_id, False,
+            f"approval gate: body carries {gate_marker!r} — card parked as blocked "
+            f"until `hermes kanban unblock {task_id}`",
+        )
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,

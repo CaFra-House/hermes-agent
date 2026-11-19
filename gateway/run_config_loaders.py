@@ -361,11 +361,56 @@ class GatewayConfigLoadersMixin:
         return out[0], out[1]
 
     @staticmethod
-    def _human_delay_from_config(config: dict) -> Optional[tuple[int, int]]:
-        """``human_delay.{mode,min_ms,max_ms}`` for one profile as a ``(lo_ms, hi_ms)`` range, or
-        ``None`` when off (#116895). ``natural`` is the fixed 800-2500 range; ``custom`` reads the
-        bounds and rejects non-integer, negative or inverted values with a warning naming the key,
-        falling back to the natural range instead of letting ``random.uniform`` raise at send."""
+    def _human_delay_schedule_from_config(config: dict) -> Optional[List[dict]]:
+        """``human_delay.schedule`` as a validated list of hourly windows, or ``None``.
+
+        Each entry is ``{from_hour, to_hour, min_ms, max_ms}``; ``from_hour > to_hour`` is a window
+        that wraps past midnight (``20 -> 8``). A malformed entry is dropped with a warning naming
+        its index rather than raising at send time, and an empty result means "no schedule", so the
+        profile keeps its static range.
+        """
+        raw = cfg_get(config, "human_delay", "schedule", default=None)
+        if not raw:
+            return None
+        if not isinstance(raw, list):
+            logger.warning("human_delay.schedule is not a list; ignoring it")
+            return None
+        out: List[dict] = []
+        for idx, slot in enumerate(raw):
+            if not isinstance(slot, dict):
+                logger.warning("human_delay.schedule[%s] is not a mapping; ignored", idx)
+                continue
+            try:
+                from_hour = int(slot.get("from_hour"))
+                to_hour = int(slot.get("to_hour"))
+                lo = int(slot.get("min_ms"))
+                hi = int(slot.get("max_ms"))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "human_delay.schedule[%s] needs integer from_hour/to_hour/min_ms/max_ms; ignored",
+                    idx)
+                continue
+            if not (0 <= from_hour <= 23 and 0 <= to_hour <= 23):
+                logger.warning(
+                    "human_delay.schedule[%s] hours must be 0-23 (got %s->%s); ignored",
+                    idx, from_hour, to_hour)
+                continue
+            if lo < 0 or hi < 0 or lo > hi:
+                logger.warning(
+                    "human_delay.schedule[%s] needs 0 <= min_ms <= max_ms (got %s-%s); ignored",
+                    idx, lo, hi)
+                continue
+            out.append({"from_hour": from_hour, "to_hour": to_hour, "min_ms": lo, "max_ms": hi})
+        return out or None
+
+    @staticmethod
+    def _human_delay_from_config(config: dict) -> Optional[tuple[int, int, Optional[List[dict]]]]:
+        """``human_delay.{mode,min_ms,max_ms,schedule}`` for one profile, or ``None`` when off
+        (#116895). Returns ``(lo_ms, hi_ms, schedule_or_none)``: the static range plus the optional
+        hourly windows that override it. ``natural`` is the fixed 800-2500 range; ``custom`` reads
+        the bounds and rejects non-integer, negative or inverted values with a warning naming the
+        key, falling back to the natural range instead of letting ``random.uniform`` raise at send.
+        """
         mode = str(cfg_get(config, "human_delay", "mode", default="off") or "off").strip().lower()
         if mode == "off":
             return None
@@ -373,7 +418,8 @@ class GatewayConfigLoadersMixin:
         if mode != "natural":
             if mode != "custom":
                 logger.warning("human_delay.mode=%r is not off/natural/custom; using natural", mode)
-                return DEFAULT_HUMAN_DELAY_RANGE_MS
+                return (*DEFAULT_HUMAN_DELAY_RANGE_MS,
+                        GatewayConfigLoadersMixin._human_delay_schedule_from_config(config))
             bounds = []
             for key, default in (("min_ms", lo), ("max_ms", hi)):
                 raw = cfg_get(config, "human_delay", key, default=None)
@@ -389,7 +435,7 @@ class GatewayConfigLoadersMixin:
             if lo > hi:
                 logger.warning("human_delay.min_ms=%s exceeds human_delay.max_ms=%s; using natural range", lo, hi)
                 lo, hi = DEFAULT_HUMAN_DELAY_RANGE_MS
-        return lo, hi
+        return lo, hi, GatewayConfigLoadersMixin._human_delay_schedule_from_config(config)
 
     def _snapshot_profile_busy_modes(self, profile_name: str, config: dict) -> None:
         """Cache a routed profile's busy policy and pacing for this gateway lifetime."""

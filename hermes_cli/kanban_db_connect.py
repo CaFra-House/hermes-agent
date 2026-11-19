@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
@@ -563,16 +564,30 @@ class RepairResult:
     post_repair_messages: list[str] = field(default_factory=list)
     backup_path: Optional[Path] = None
     reindexed: list[str] = field(default_factory=list)
+    recycled_workers: list[int] = field(default_factory=list)
+    """Worker pids killed by the post-repair recycle pass (their handles held the
+    board's retired WAL generation). Requeued by the sweep WITHOUT failures."""
+    stale_holders: list[int] = field(default_factory=list)
+    """Non-worker pids still holding the retired generation (gateway, operator CLI):
+    reported, never killed — restart them manually if they keep failing."""
 
 
-def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> RepairResult:
+def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None,
+              recycle_workers: bool = True) -> RepairResult:
     """Probe a kanban DB and apply the narrow index-REINDEX repair if needed.
     Same policy as :func:`_guard_existing_db_is_healthy` (quarantine BEFORE
     any mutation; REINDEX under the init flock; anything non-index stays
     corrupt), but returns a :class:`RepairResult` instead of raising so
     ``hermes kanban repair`` can pick its exit code. ``OperationalError``
     (locked/busy) still propagates raw: a locked healthy DB must not be
-    quarantined."""
+    quarantined.
+
+    ``recycle_workers`` (default on): after any probe/repair, kill the live
+    workers whose handles hold this board's retired WAL generation (repair /
+    file swap / WAL rotation under a running board) and leave an infrastructure
+    exit trailer so the sweep requeues their cards WITHOUT counting a failure —
+    the card's own pedido for this repair path.
+    """
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     try:
         resolved = path.resolve()
@@ -586,30 +601,63 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         if messages is None:
             # Same quarantine the connect-time guard takes when sqlite
             # refuses to open the file at all.
-            return RepairResult(
+            result = RepairResult(
                 status="corrupt", db_path=resolved, messages=[str(reason)],
                 backup_path=_backup_corrupt_db(resolved),
             )
-        if reason is None:
-            return RepairResult(status="ok", db_path=resolved, messages=messages)
+        elif reason is None:
+            result = RepairResult(status="ok", db_path=resolved, messages=messages)
+        else:
+            # Quarantine FIRST — identical policy to the connect-time guard.
+            backup = _backup_corrupt_db(resolved)
+            index_names = _repairable_index_names(messages)
+            if not index_names:
+                result = RepairResult(status="corrupt", db_path=resolved, messages=messages, backup_path=backup)
+            else:
+                repaired, post = _attempt_index_reindex_repair(resolved, index_names)
+                # The file changed on disk; force the next connect() in this process
+                # to re-probe instead of trusting the stale healthy-path cache.
+                with _INIT_LOCK:
+                    _INITIALIZED_PATHS.discard(str(resolved))
+                result = RepairResult(
+                    status="repaired" if repaired else "corrupt",
+                    db_path=resolved,
+                    messages=messages,
+                    post_repair_messages=post,
+                    backup_path=backup,
+                    reindexed=index_names,
+                )
+    if recycle_workers and result.status != "missing":
+        _recycle_stale_workers(result, board=board)
+    return result
 
-        # Quarantine FIRST — identical policy to the connect-time guard.
-        backup = _backup_corrupt_db(resolved)
-        index_names = _repairable_index_names(messages)
-        if not index_names:
-            return RepairResult(status="corrupt", db_path=resolved, messages=messages, backup_path=backup)
-        repaired, post = _attempt_index_reindex_repair(resolved, index_names)
-        # The file changed on disk; force the next connect() in this process
-        # to re-probe instead of trusting the stale healthy-path cache.
-        with _INIT_LOCK:
-            _INITIALIZED_PATHS.discard(str(resolved))
-        return RepairResult(
-            status="repaired" if repaired else "corrupt",
-            db_path=resolved,
-            messages=messages,
-            post_repair_messages=post,
-            backup_path=backup,
-            reindexed=index_names,
+
+def _recycle_stale_workers(result: "RepairResult", *, board: Optional[str] = None) -> None:
+    """Kill workers holding this board's retired WAL generation; fold the outcome into *result*.
+
+    See :func:`hermes_cli.kanban_db_dispatch.recycle_stale_workers` for the kill policy
+    (SIGKILL + infrastructure exit trailer; never SIGTERM — a graceful close can run
+    SQLite's close-time checkpoint and replay retired frames onto the repaired file).
+    Non-worker holders are reported in ``result.stale_holders``, never killed.
+    """
+    from hermes_cli.kanban_db_dispatch import recycle_stale_workers
+    try:
+        outcome = recycle_stale_workers(result.db_path, board=board)
+    except Exception as exc:  # never mask the repair outcome behind a recycle hiccup
+        _kb._log.warning("kanban repair: stale-worker recycle pass failed: %s", exc)
+        return
+    result.recycled_workers = sorted({pid for _task_id, pid in outcome["recycled"]})
+    result.stale_holders = sorted({pid for pid, _target in outcome["holders"]})
+    if outcome["recycled"]:
+        _kb._log.warning(
+            "kanban repair: recycled %d worker(s) holding the retired WAL generation: %s",
+            len(result.recycled_workers), result.recycled_workers,
+        )
+    if outcome["holders"]:
+        _kb._log.warning(
+            "kanban repair: non-worker processes still hold the retired WAL generation "
+            "(restart them manually if board writes keep failing): %s",
+            result.stale_holders,
         )
 
 
@@ -661,6 +709,7 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     except Exception:
         conn.close()
         raise
+    _note_generation(path)
     return conn, out
 
 
@@ -712,6 +761,120 @@ def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
         raise ValueError(f"kanban board {slug!r} does not exist; create it with `hermes kanban boards create {slug}`")
 
 
+class KanbanStaleWalGenerationError(sqlite3.DatabaseError):
+    """This process holds the board DB's retired ``-wal``/``-shm`` generation.
+
+    A repair, file swap or WAL rotation unlinked/replaced the sidecars while a long-lived
+    connection here kept its descriptors. Measured consequences (2026-10-31, SQLite 3.53):
+    every write through the process then fails cryptically (``file is not a database`` /
+    ``disk I/O error``) even on FRESH connections, and closing a writable stale handle can
+    replay retired frames onto the repaired file — silent corruption that passes
+    ``integrity_check``. Raised instead, naming the offending fds. The dispatcher recycles
+    such workers (exit code 69 -> requeued WITHOUT counting a failure); a fresh process is
+    always healthy."""
+
+
+# ``connect`` staleness guard: per-db-path (last sidecar identity, last scan monotonic,
+# last scan hits). Identity unchanged since a clean scan => no generation was retired here.
+_SELF_SIDECAR_STATE: dict[str, tuple] = {}
+_SELF_SIDECAR_SCAN_INTERVAL = 0.25   # seconds between scans while identities churn
+_SELF_STALE_HEAL_TIMEOUT = 2.0       # seconds to wait for in-process self-heal before raising
+
+
+def _sidecar_identity(path: Path) -> tuple:
+    """``(wal_identity, shm_identity)`` for *path*'s current sidecars (None per absent)."""
+    ident = []
+    for suffix in ("-wal", "-shm"):
+        try:
+            st = os.stat(f"{path}{suffix}")
+            ident.append((st.st_dev, st.st_ino))
+        except OSError:
+            ident.append(None)
+    return tuple(ident)
+
+
+def _self_stale_sidecar_holders(db_path: Path) -> list[str]:
+    """This process's fds holding an unlinked/replaced ``-wal``/``-shm`` generation of *db_path*.
+
+    The `` (deleted)`` suffix is only a pre-filter: the verdict is the identity comparison
+    (:func:`hermes_state_dbfile._fd_is_truly_unlinked`), immune to OpenZFS's false
+    ``(deleted)`` and to a surviving hard link keeping a truly orphaned inode looking linked.
+    Empty list = healthy.
+    """
+    from hermes_state_dbfile import _fd_is_truly_unlinked, canonical_sqlite_path
+    literal_base = os.path.abspath(os.fspath(db_path))
+    watched: dict[str, str] = {}
+    for base in (literal_base, os.path.realpath(literal_base)):
+        for suffix in ("-wal", "-shm"):
+            watched.setdefault(canonical_sqlite_path(base + suffix), base + suffix)
+    hits: list[str] = []
+    try:
+        fds = os.listdir("/proc/self/fd")
+    except OSError:
+        return []
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if " (deleted)" not in target:
+            continue
+        canonical = canonical_sqlite_path(target[: -len(" (deleted)")])
+        if canonical not in watched:
+            continue
+        if _fd_is_truly_unlinked(f"/proc/self/fd/{fd}", watched[canonical]):
+            hits.append(f"fd {fd} -> {target}")
+    return hits
+
+
+def _note_generation(path: Path) -> None:
+    """Record the sidecar identity this process's newest connection adopted.
+
+    Called right after a successful open: the baseline is the generation the process
+    now HOLDS, so the next :func:`_self_generation_guard` comparison detects a
+    retirement (the path's sidecars changed or vanished) even when both the pre-open
+    and the post-rotation states are "absent" — exactly the ``rm -f *-wal`` repair case."""
+    key = str(path)
+    state = _SELF_SIDECAR_STATE.get(key)
+    _SELF_SIDECAR_STATE[key] = (_sidecar_identity(path), time.monotonic(), state[2] if state else [])
+
+
+def _self_generation_guard(db_path: Path) -> None:
+    """Fail closed when this process holds the board DB's retired WAL generation.
+
+    Called on every :func:`connect`. Healthy fast path: two ``stat`` calls and a dict probe.
+    When the sidecar identity changed (or no scan happened yet), scan this process's fds; if
+    stale holders exist, give in-process self-heal (e.g. the worker watcher thread reopening
+    its read-only connection — a read-only close cannot replay retired frames) up to
+    ``_SELF_STALE_HEAL_TIMEOUT`` before raising :class:`KanbanStaleWalGenerationError`.
+    """
+    key = str(db_path)
+    state = _SELF_SIDECAR_STATE.get(key)
+    current = _sidecar_identity(db_path)
+    if state is not None and state[0] == current:
+        return  # identity unchanged since the last note: no generation was retired here
+    hits = _self_stale_sidecar_holders(db_path)
+    _SELF_SIDECAR_STATE[key] = (current, time.monotonic(), hits)
+    if not hits:
+        return
+    deadline = time.monotonic() + _SELF_STALE_HEAL_TIMEOUT
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        hits = _self_stale_sidecar_holders(db_path)
+        if not hits:
+            _SELF_SIDECAR_STATE[key] = (_sidecar_identity(db_path), time.monotonic(), [])
+            return
+    from hermes_cli.kanban_db import KANBAN_INFRASTRUCTURE_EXIT_CODE
+    raise KanbanStaleWalGenerationError(
+        "kanban.db's WAL generation was retired (repair / file swap / WAL rotation) while "
+        f"this process held it: {'; '.join(hits)}. Writes through these stale handles are "
+        "refused: they fail cryptically and a stale writable handle can replay retired frames "
+        "onto the repaired database. This worker is recycled by the dispatcher (exit "
+        f"{KANBAN_INFRASTRUCTURE_EXIT_CODE} -> requeued without counting a failure); use a "
+        "fresh process (hermes kanban ...) to touch the board meanwhile."
+    )
+
+
 def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
@@ -720,6 +883,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _self_generation_guard(Path(path))
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a

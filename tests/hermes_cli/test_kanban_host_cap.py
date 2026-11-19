@@ -360,3 +360,45 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+# ---------------------------------------------------------------------------
+# 4. Fail-closed running count (2026-10-31, board-corruption incident)
+# ---------------------------------------------------------------------------
+
+
+def test_count_running_tasks_fails_closed_on_db_error():
+    """An unreadable count must raise, not report 0 (silent cap removal).
+
+    Regression guard for 2026-10-31: a failing SELECT during board corruption
+    made ``count_running_tasks`` return 0, erasing ``max_in_progress`` and
+    admitting 8 concurrent runs against a cap of 4 in one tick.
+    """
+
+    class Broken:
+        def execute(self, *_a, **_k):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        kbd.count_running_tasks(Broken())
+
+
+def test_dispatch_fail_closed_no_spawns_when_count_fails(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A failing running-count blocks the whole tick's spawns (fail-closed)."""
+
+    def boom(_conn):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kbd, "count_running_tasks", boom)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="wants-to-run", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert not spawns
+    assert not res.spawned

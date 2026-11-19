@@ -353,6 +353,18 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_recycle(report) -> None:
+    """Human-readable post-repair worker recycle (WAL-generation retirement)."""
+    if getattr(report, "recycled_workers", None):
+        print(f"  recycled stale workers (retired WAL generation): "
+              f"{', '.join(str(p) for p in report.recycled_workers)}")
+        print("    their cards were requeued WITHOUT counting a failure (exit trailer rc=69).")
+    if getattr(report, "stale_holders", None):
+        print(f"  non-worker processes still hold the retired WAL generation: "
+              f"{', '.join(str(p) for p in report.stale_holders)}")
+        print("    restart them manually if board writes keep failing (never killed here).")
+
+
 def _cmd_repair(args: argparse.Namespace) -> int:
     """Integrity check + narrow index-REINDEX auto-repair. Dispatched BEFORE
     the auto ``kb.init_db()`` (init refuses corrupt DBs). Exit 0 = healthy /
@@ -370,6 +382,8 @@ def _cmd_repair(args: argparse.Namespace) -> int:
             "post_repair_messages": report.post_repair_messages,
             "backup_path": str(report.backup_path) if report.backup_path else None,
             "reindexed": report.reindexed,
+            "recycled_workers": getattr(report, "recycled_workers", []),
+            "stale_holders": getattr(report, "stale_holders", []),
         }, ascii=True)
         return 0 if report.status in {"ok", "repaired", "missing"} else 1
 
@@ -378,6 +392,7 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         return 0
     if report.status == "ok":
         print(f"{report.db_path}: integrity_check ok — no repair needed.")
+        _report_recycle(report)
         return 0
     if report.status == "repaired":
         print(f"{report.db_path}: repaired.")
@@ -385,6 +400,7 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         if report.backup_path:
             print(f"  pre-repair backup: {report.backup_path}")
         print("  integrity_check now ok.")
+        _report_recycle(report)
         return 0
     # still corrupt
     def err(line: str) -> None:

@@ -214,14 +214,48 @@ def _watch_submitter(db, run_id):
     from hermes_cli.kanban_db_dispatch import _worker_alive
 
     def watch():
-        with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        db_path = db.resolve()
+
+        def open_conn():
+            return sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True)
+
+        def sidecar_identity():
+            ident = []
+            for suffix in ('-wal', '-shm'):
+                try:
+                    st = os.stat(f'{db_path}{suffix}')
+                    ident.append((st.st_dev, st.st_ino))
+                except OSError:
+                    ident.append(None)
+            return tuple(ident)
+
+        conn = open_conn()
+        generation = sidecar_identity()
+        try:
             while not _TURNS_DONE.wait(1.0):
+                if sidecar_identity() != generation:
+                    # The board's WAL generation was retired (repair / file swap / WAL
+                    # rotation) under this read-only handle: its fds are orphaned and the
+                    # whole process loses every board write until every stale handle closes
+                    # (measured 2026-10-31: even FRESH connections fail). Reopen now — a
+                    # read-only close cannot replay retired frames, so this is the safe
+                    # self-heal; ``kanban_db_connect.connect`` waits up to 2 s for it.
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.close()
+                    try:
+                        conn = open_conn()
+                        generation = sidecar_identity()
+                    except sqlite3.Error:
+                        generation = None  # keep retrying next tick
                 try:
                     row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
                 except sqlite3.Error:
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
                     os._exit(1)
+        finally:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
 
 
