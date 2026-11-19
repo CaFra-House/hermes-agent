@@ -9,6 +9,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from contextlib import contextmanager, suppress
 from functools import wraps
 from pathlib import Path
@@ -110,6 +111,91 @@ def _pid_looks_like_node_bridge(pid: int) -> bool:
 _SIGTERM_GRACE_S = 5.0
 _BRIDGE_PORT_FREE_TIMEOUT_S = 10.0
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # escalation paths below are POSIX-only
+
+# Inbound duplicate guard (see ``_is_duplicate_inbound``).  The bridge already drops repeats of
+# its own queue, but a bridge that predates that fix, or a retransmission that lands after a
+# bridge restart, can still hand the same message twice — and each copy runs its own agent
+# turn.  10 min covers WhatsApp's retry window; 500 ids keep memory flat on a busy line.
+_INBOUND_DEDUPE_TTL_S = 600.0
+_INBOUND_DEDUPE_MAX = 500
+# Content-level guard (see ``_inbound_duplicate_reason``).  WhatsApp retransmits the same customer
+# send ~2 s later under a *different* message id and native type ('conversation' vs
+# 'extendedTextMessage'), so the id guard above never sees that pair and the customer gets two
+# agent turns.  Same chat + same normalized text inside 6 s is one message; media is never keyed.
+_INBOUND_TEXT_DEDUPE_WINDOW_S = 6.0
+_INBOUND_TEXT_DEDUPE_MAX = 500
+
+
+def _normalize_inbound_text(text: Any) -> str:
+    """Strip and collapse whitespace for content de-duplication; case and punctuation are kept."""
+    return " ".join(str(text or "").split())
+
+
+# WhatsApp uses single-asterisk bold. Models (and the profile SOUL) often emit
+# Markdown ``**bold**``; WhatsApp then renders the outer asterisks as literal
+# characters around the bold text. Normalize before sending, outside fences.
+_WHATSAPP_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.S)
+
+
+def _format_whatsapp_markdown(text: str) -> str:
+    """Convert Markdown ``**bold**`` to WhatsApp ``*bold*`` outside code fences."""
+    if "**" not in text:
+        return text
+    parts = text.split("```")
+    for i in range(0, len(parts), 2):
+        parts[i] = _WHATSAPP_BOLD_RE.sub(r"*\1*", parts[i])
+    return "```".join(parts)
+
+
+# Inbound DM text prefix (see ``_apply_dm_sender_prefix``).  The bridge resolves
+# the patient's real phone (LID → phone) and sends it as ``senderPhone``; the
+# agent needs ``[+<phone> | <name>]`` at the start of the text to verify or
+# create the CRM lead without asking the patient anything.
+_DM_SENDER_PREFIX_RE = re.compile(r"^\[\+\d+ \| [^\]]*\]\s")
+
+
+def _apply_dm_sender_prefix(body: str, data: dict[str, Any], enabled: bool) -> str:
+    """Prepend ``[+<phone> | <name>] `` to an inbound DM's text when enabled.
+
+    Only DMs with a resolved phone and a display name get the prefix; groups,
+    fromMe/owner events, media-only messages (empty body) and already-prefixed
+    texts are left untouched, so a retransmission can never double it.  The
+    phone comes from the WhatsApp envelope / LID map, not from the patient's
+    text; the display name is attacker-influenceable, so brackets and line
+    breaks are stripped before it enters the envelope.
+    """
+    if not enabled or data.get("isGroup"):
+        return body
+    receipt_key = data.get("readReceiptKey")
+    from_me = bool(
+        data.get("fromMe")
+        or data.get("fromOwner")
+        or (isinstance(receipt_key, dict) and receipt_key.get("fromMe"))
+    )
+    if from_me:
+        return body
+    text = str(body or "")
+    if not text.strip():
+        return body
+    phone = re.sub(r"\D", "", str(data.get("senderPhone") or ""))
+    name = " ".join(str(data.get("senderName") or "").replace("[", "").replace("]", "").split())
+    if not phone or not name:
+        return body
+    if _DM_SENDER_PREFIX_RE.match(text):
+        return body
+    return f"[+{phone} | {name[:64]}] {text}"
+
+
+def _prune_bounded(table: dict, now: float, ttl: float, cap: int) -> None:
+    """Drop expired entries from *table* (insertion-ordered) and enforce *cap*."""
+    if len(table) <= cap:
+        return
+    for stale in [key for key, seen_at in table.items() if now - seen_at >= ttl]:
+        table.pop(stale, None)
+    # Dict preserves insertion order and a repeat never refreshes its timestamp,
+    # so the first key is the oldest one.
+    while len(table) > cap:
+        table.pop(next(iter(table)), None)
 
 
 def _pids_alive(pids: list) -> list:
@@ -667,6 +753,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
         self._session_path = _session_dir(extra)
         self._reply_prefix: Optional[str] = extra.get("reply_prefix")
+        # Config gate: platforms.whatsapp.extra.dm_sender_prefix.  Off by default so
+        # every other profile keeps the bare-text behavior; Enua's reception profile
+        # turns it on to receive "[+<phone> | <name>] <text>" on inbound DMs.
+        _dm_prefix = extra.get("dm_sender_prefix", False)
+        self._dm_sender_prefix = (
+            _dm_prefix if isinstance(_dm_prefix, bool)
+            else str(_dm_prefix or "").strip().lower() in {"1", "true", "yes", "on"}
+        )
         self._dm_policy = str(_extra_or_secret(extra, "dm_policy", "WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(self._select_dm_allowlist(extra, ("WHATSAPP_ALLOWED_USERS",), _wenv))
         self._group_policy = str(_extra_or_secret(extra, "group_policy", "WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
@@ -679,6 +773,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
+        # (chat_id, message_id) -> monotonic time of the last dispatch; see _is_duplicate_inbound.
+        self._recent_inbound_keys: dict[tuple[str, str], float] = {}
+        # (chat_id, normalized text) -> first sighting; catches the same customer send arriving
+        # under a different id a couple of seconds later.  See _inbound_duplicate_reason.
+        self._recent_inbound_texts: dict[tuple[str, str], float] = {}
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
         self._bridge_token = ""  # loaded in connect(); the session dir may not exist yet
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
@@ -1194,12 +1293,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         chat_id = to_whatsapp_jid(chat_id)
         try:
-            chunks = self.truncate_message(self.format_message(content), self._outgoing_chunk_limit())
+            chunks = self.truncate_message(self.format_message(_format_whatsapp_markdown(content)), self._outgoing_chunk_limit())
             sent_message_ids: list[str] = []
             last_message_id = None
             for idx, chunk in enumerate(chunks):
                 payload: dict[str, Any] = {"chatId": chat_id, "message": chunk}
-                if reply_to and idx == 0:
+                # LOCAL CaFra (15/11): con WHATSAPP_NO_QUOTE=true no se cita el mensaje del
+                # paciente; un humano no responde siempre con "Responder" (orden de Julio).
+                _quote_off = str(os.getenv("WHATSAPP_NO_QUOTE", "")).strip().lower() in ("1", "true", "yes", "on")
+                if reply_to and idx == 0 and not _quote_off:
                     payload["replyTo"] = reply_to  # Reply-to on the first chunk only.
                 result = await self._post_bridge_message("send", payload, timeout=30)
                 if not result.success:
@@ -1320,6 +1422,66 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] {bridge_exit}")
         return bool(bridge_exit)
 
+    @staticmethod
+    def _inbound_text_key(data: dict[str, Any]) -> Optional[tuple[str, str]]:
+        """``(chat_id, normalized_text)`` for a text-only inbound event, else ``None``.
+
+        Media is never keyed by content: an uncaptioned photo or voice note has no text to compare,
+        and two different attachments can share a caption, so a content match must never drop one.
+        Empty bodies are never keyed either.
+        """
+        if data.get("hasMedia") or data.get("mediaUrls") or data.get("quotedMediaUrls"):
+            return None
+        if str(data.get("mediaType") or "").strip():
+            return None
+        text = _normalize_inbound_text(data.get("body"))
+        if not text:
+            return None
+        return (str(data.get("chatId") or ""), text)
+
+    def _inbound_duplicate_reason(self, data: dict[str, Any]) -> Optional[str]:
+        """``None`` when this bridge event is new, else why it repeats one already dispatched.
+
+        Two independent guards, both scoped to one chat:
+
+        ``"text"``
+            Same normalized text within ``_INBOUND_TEXT_DEDUPE_WINDOW_S``.  WhatsApp retransmits
+            the same customer send about 2 s later with a *different* message id and native type
+            (``conversation`` vs ``extendedTextMessage``), so an id-keyed guard alone never sees
+            it and one customer message becomes two agent turns and two replies.
+        ``"id"``
+            Same ``(chatId, messageId)`` within ``_INBOUND_DEDUPE_TTL_S``: Baileys' 'append' +
+            'notify' duplicate, or a bridge that predates its own id guard.
+
+        A repeat never refreshes its timestamp, so a burst of identical sends cannot extend its
+        own suppression window.
+        """
+        now = time.monotonic()
+        chat_id = str(data.get("chatId") or "")
+
+        text_key = self._inbound_text_key(data)
+        if text_key is not None:
+            seen_at = self._recent_inbound_texts.get(text_key)
+            if seen_at is not None and now - seen_at < _INBOUND_TEXT_DEDUPE_WINDOW_S:
+                return "text"
+            self._recent_inbound_texts[text_key] = now
+            _prune_bounded(self._recent_inbound_texts, now, _INBOUND_TEXT_DEDUPE_WINDOW_S, _INBOUND_TEXT_DEDUPE_MAX)
+
+        message_id = str(data.get("messageId") or "")
+        if not message_id:
+            return None
+        key = (chat_id, message_id)
+        seen_at = self._recent_inbound_keys.get(key)
+        if seen_at is not None and now - seen_at < _INBOUND_DEDUPE_TTL_S:
+            return "id"
+        self._recent_inbound_keys[key] = now
+        _prune_bounded(self._recent_inbound_keys, now, _INBOUND_DEDUPE_TTL_S, _INBOUND_DEDUPE_MAX)
+        return None
+
+    def _is_duplicate_inbound(self, data: dict[str, Any]) -> bool:
+        """True when this bridge event repeats a message already dispatched to the agent."""
+        return self._inbound_duplicate_reason(data) is not None
+
     async def _poll_messages(self) -> None:
         while self._running:
             if not self._http_session or await self._report_bridge_exit():
@@ -1330,6 +1492,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         for msg_data in await resp.json():
                             if msg_data.get("event") == "delivery_status":
                                 self._log_delivery_status(msg_data)
+                                continue
+                            duplicate_reason = self._inbound_duplicate_reason(msg_data)
+                            if duplicate_reason:
+                                logger.info(
+                                    "[%s] Dropping duplicate inbound WhatsApp message %s in chat %s "
+                                    "(%s duplicate, %d chars)",
+                                    self.name, msg_data.get("messageId"), msg_data.get("chatId"),
+                                    duplicate_reason, len(_normalize_inbound_text(msg_data.get("body"))),
+                                )
                                 continue
                             # A group voice note may wait on gate-time STT: run it off this poll loop, FIFO per chat.
                             chat, work = str(msg_data.get("chatId") or ""), chat_ordered_work(self)
@@ -1510,6 +1681,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             media_text_inlined: list[bool] = []
             if msg_type == MessageType.DOCUMENT and cached_urls and not caption_is_command(body):
                 body, media_text_inlined = self._inject_document_text(cached_urls, body)
+            body = _apply_dm_sender_prefix(body, data, getattr(self, "_dm_sender_prefix", False))
             native_metadata = data.get("nativeMetadata")
             metadata: dict[str, Any] = {k: v for k, v in (
                 ("whatsapp_native_type", str(data.get("nativeType") or "").strip()),

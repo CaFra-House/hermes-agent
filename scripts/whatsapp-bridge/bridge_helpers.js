@@ -23,6 +23,52 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(/:\d+(?=@)/, '').replace(/:\d+$/, '');
 }
 
+/**
+ * Map one session-dir lid-mapping file to its `[lid, phone]` pair, or null.
+ *
+ * Baileys writes two complementary shapes and only the pair matters here:
+ *   `lid-mapping-<phone>.json`          → contents are the LID
+ *   `lid-mapping-<lid>_reverse.json`    → contents are the phone
+ * A real first contact may have only the `_reverse` file (the incident's
+ * `lid-mapping-274293875294228_reverse.json` → "5491137928875"), so a reader
+ * that ignores it cannot resolve the sender at all.
+ */
+export function lidMappingEntry(filename, contents) {
+  const name = String(filename || '');
+  const value = String(contents ?? '').trim();
+  if (!/^\d+$/.test(value)) return null;
+  const reverse = name.match(/^lid-mapping-(\d+)_reverse\.json$/);
+  if (reverse) return [reverse[1], value];
+  const forward = name.match(/^lid-mapping-(\d+)\.json$/);
+  if (forward) return [value, forward[1]];
+  return null;
+}
+
+/**
+ * The real phone number of a DM sender, digits only (country code included), or ''.
+ *
+ * WhatsApp addresses an increasing share of DMs by LID (`<lid>@lid`), and the
+ * bridge used to forward only that opaque id, so the agent never saw a phone.
+ * Prefer the phone twin Baileys puts on the envelope (`remoteJidAlt` /
+ * `participantAlt`); otherwise resolve the chat's LID through the session map.
+ * Groups and fromMe events have no patient phone: never invent one.
+ */
+export function resolveInboundSenderPhone({ chatId, senderAltId, lidToPhone, isGroup, fromMe } = {}) {
+  if (fromMe || isGroup) return '';
+  const alt = String(senderAltId || '');
+  if (alt.endsWith('@s.whatsapp.net')) {
+    const digits = alt.replace(/@.*/, '').replace(/:\d+$/, '').replace(/\D/g, '');
+    if (digits) return digits;
+  }
+  const chat = String(chatId || '');
+  if (chat.endsWith('@lid')) {
+    const lid = chat.replace(/@lid$/, '').replace(/:\d+$/, '');
+    const digits = String((lidToPhone || {})[lid] || '').replace(/\D/g, '');
+    if (digits) return digits;
+  }
+  return '';
+}
+
 function unwrapMessageEnvelopes(content) {
   let cur = content;
   // Envelopes nest (ephemeral wrapping viewOnce wrapping the payload); peel
@@ -59,6 +105,105 @@ export function getContextInfo(messageContent) {
     }
   }
   return {};
+}
+
+/**
+ * Dedupe key for an inbound message, or null when it must not be deduplicated.
+ *
+ * Baileys can emit the same incoming message twice ('append' then 'notify', or
+ * a retransmission after a lost ack).  The bridge remembers this key before
+ * queueing and drops the repeat, so one customer message never becomes two
+ * agent turns.  ``fromMe`` events keep their own echo/owner handling and are
+ * never keyed; an event without a message id is always let through.
+ */
+export function inboundDedupeKey({ chatId, messageId, fromMe } = {}) {
+  if (fromMe || !messageId) return null;
+  return `${chatId || ''}:${messageId}`;
+}
+
+/**
+ * Normalize a text body for content de-duplication: strip the ends and collapse
+ * every run of whitespace to a single space.  Case and punctuation are kept —
+ * "Hola" and "hola" are different customer messages, not a retransmission.
+ */
+export function normalizeInboundText(text) {
+  return String(text ?? '').trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Content de-dupe key for an inbound *text* message, or null when the event
+ * must never be deduplicated by content.
+ *
+ * WhatsApp retransmits the same customer send about 2 s later under a
+ * DIFFERENT message id and a different native type ('conversation' vs
+ * 'extendedTextMessage'), so an id-keyed guard never sees the pair and the
+ * agent runs two turns for one message.  Keying on chat + normalized text
+ * inside a short window catches that retransmission.
+ *
+ * Media is never keyed: attachments carry no reliable text (an uncaptioned
+ * photo has none at all) and two different files can share a caption, so a
+ * content match must never drop one.  Empty bodies are never keyed either.
+ */
+export function inboundTextDedupeKey({ chatId, body, hasMedia, mediaType, mediaUrls, quotedMediaUrls } = {}) {
+  if (hasMedia) return null;
+  if (mediaType) return null;
+  if (Array.isArray(mediaUrls) && mediaUrls.length > 0) return null;
+  if (Array.isArray(quotedMediaUrls) && quotedMediaUrls.length > 0) return null;
+  const text = normalizeInboundText(body);
+  if (!text) return null;
+  // NUL cannot appear in a WhatsApp JID, so chat and text cannot collide.
+  return `${chatId || ''}\u0000${text}`;
+}
+
+/**
+ * Bounded, time-windowed set of inbound content keys.
+ *
+ * ``has`` reports whether *key* was remembered less than ``windowMs`` ago and
+ * forgets it once it is older, so a genuinely repeated message after the
+ * window still reaches the agent.  ``remember`` never refreshes an existing
+ * entry: a burst of identical sends cannot keep extending its own suppression.
+ * ``now`` is injectable so the window is testable without sleeping.
+ */
+export function createInboundTextTracker({ windowMs = 6000, maxSize = 512, now = Date.now } = {}) {
+  if (!(windowMs > 0)) {
+    throw new RangeError('createInboundTextTracker: windowMs must be > 0');
+  }
+  if (!Number.isInteger(maxSize) || maxSize < 1) {
+    throw new RangeError('createInboundTextTracker: maxSize must be a positive integer');
+  }
+  const seen = new Map(); // key -> monotonic-ish timestamp of the first sighting
+
+  function prune(t) {
+    for (const [key, at] of seen) {
+      if (t - at >= windowMs) seen.delete(key);
+    }
+    while (seen.size > maxSize) {
+      // Map iteration order is insertion order, so the first key is the oldest.
+      seen.delete(seen.keys().next().value);
+    }
+  }
+
+  function has(key) {
+    if (!key) return false;
+    const at = seen.get(key);
+    if (at === undefined) return false;
+    if (now() - at < windowMs) return true;
+    seen.delete(key);
+    return false;
+  }
+
+  function remember(key) {
+    if (!key || seen.has(key)) return;
+    const t = now();
+    seen.set(key, t);
+    prune(t); // after the insert, so the cap actually applies
+  }
+
+  function size() {
+    return seen.size;
+  }
+
+  return { has, remember, size };
 }
 
 export function createBoundedMessageStore(limit = 512) {

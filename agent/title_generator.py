@@ -628,6 +628,18 @@ def generate_title(
     except Exception:  # fail open: a broken validator must not disable titling
         logger.debug("Title runtime validator raised; proceeding", exc_info=True)
     user_snippet = build_title_input(user_message, title_preview)
+    # LOCAL CaFra (15/11, pedido de Julio): en WhatsApp el titulo de la sesion debe ser el
+    # NOMBRE DEL PACIENTE, no el tema ("Solicitar mas informacion #2"). El bridge antepone
+    # "[+549... | Nombre]" al primer mensaje de cada DM.
+    try:
+        import re as _re
+        _m = _re.match(r"^\[\+?[0-9*\s]+\|\s*([^\]\n]{1,40})\]", (user_snippet or "").strip())
+        if _m:
+            _name = _m.group(1).strip()
+            if _name and not _name.replace("*", "").isdigit():
+                return _name
+    except Exception:
+        pass
     if not user_snippet.strip() or (
         # An attachment-only opener (manual attach, no paste preview) reaches
         # here via auto_title_session, which lacks the instant-title guard:
