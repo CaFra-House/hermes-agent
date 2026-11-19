@@ -895,8 +895,10 @@ class _ChildRun:
         with _quiet("Child cwd seed failed: %s"):
             from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
             parent_cwd = get_session_cwd(self.parent_task_id)
+            brief_cwd = getattr(self.child, "_delegate_brief_cwd", None)
+            initial_cwd = brief_cwd if (isinstance(brief_cwd, str) and os.path.isdir(brief_cwd)) else parent_cwd
             with child_profile_scope(self.child):
-                record_session_cwd(self.child_task_id, resumed["cwd"] if resumed else parent_cwd)
+                record_session_cwd(self.child_task_id, resumed["cwd"] if resumed else initial_cwd)
             register_container_alias(self.child_task_id, self.parent_task_id)
 
         if resumed is not None:

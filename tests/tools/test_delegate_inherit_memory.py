@@ -19,6 +19,11 @@ from tools.delegate_tool_config import (
     _get_max_concurrent_children_for_depth,
     _get_max_concurrent_grandchildren,
 )
+from tools.delegate_tool_progress import (
+    _build_child_system_prompt,
+    _extract_brief_project_and_path,
+    _format_project_ownership_block,
+)
 
 
 class _DummyExternalProvider(MemoryProvider):
@@ -32,6 +37,7 @@ class _DummyExternalProvider(MemoryProvider):
         self.session_ends: list[list] = []
         self.shutdown_called = False
         self.auto_retain = False
+        self._recall_sync = False
 
     @property
     def name(self) -> str:
@@ -84,6 +90,7 @@ class TestSubagentMemoryHooksBloqueoA(unittest.TestCase):
         self.assertEqual(prov.init_kwargs.get("agent_context"), "primary")
         self.assertNotIn("allow_fork_hooks", prov.init_kwargs)
         self.assertTrue(prov.auto_retain)
+        self.assertTrue(prov._recall_sync)
 
         recalled = mgr.prefetch_all("check project status", session_id="sub-1")
         self.assertIn("check project status", recalled)
@@ -108,6 +115,7 @@ class TestSubagentMemoryHooksBloqueoA(unittest.TestCase):
         self.assertTrue(mgr._fork_turn_hooks_suppressed())
         self.assertEqual(prov.init_kwargs.get("agent_context"), "subagent")
         self.assertFalse(prov.auto_retain)
+        self.assertFalse(prov._recall_sync)
         self.assertEqual(mgr.prefetch_all("hello", session_id="sub-2"), "")
         mgr.sync_all("hello", "world", session_id="sub-2")
         mgr.flush_pending(timeout=2.0)
@@ -213,6 +221,53 @@ class TestHierarchy4x2Concurrency(unittest.TestCase):
         self.assertIn("error", res)
         self.assertIn("Too many tasks: 3 provided", res["error"])
         self.assertIn("2", res["error"])
+
+
+class TestProjectBriefAndOwnershipAutoInjection(unittest.TestCase):
+    def test_extracts_linux_and_windows_project_and_ruta(self):
+        p1, r1 = _extract_brief_project_and_path(
+            "PROYECTO: ADEN_CRM | RUTA: `/home/ubuntu/WORKSPACE/PROJECTS/ADEN/CRM/ADEN_CRM-PROD`\nRevisar API",
+            None,
+        )
+        self.assertEqual(p1, "ADEN_CRM")
+        self.assertEqual(r1, "/home/ubuntu/WORKSPACE/PROJECTS/ADEN/CRM/ADEN_CRM-PROD")
+
+        p2, r2 = _extract_brief_project_and_path(
+            "Segmentar caso",
+            "PROYECTO: ADEN_DENTAL | RUTA: C:\\WORKSPACE\\PROJECTS\\ADEN_DENTAL",
+        )
+        self.assertEqual(p2, "ADEN_DENTAL")
+        self.assertEqual(r2, r"C:\WORKSPACE\PROJECTS\ADEN_DENTAL")
+
+    def test_formats_compact_ownership_block_and_embeds_in_prompt(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            docs = Path(td) / "docs"
+            docs.mkdir(parents=True)
+            (docs / "OWNERSHIP.yaml").write_text(
+                "repos:\n"
+                "  ADEN_CRM:\n"
+                "    clase: P\n"
+                "    estado: vivo\n"
+                "    owner: aden\n"
+                "    rama_integracion: dev\n"
+                "    rama_produccion: main\n"
+                "    ruta_local: /home/ubuntu/WORKSPACE/PROJECTS/ADEN/CRM/ADEN_CRM-PROD\n"
+                "    code_owners: [dev-backend, dev-frontend]\n"
+                "    reviewers: [qa]\n"
+                "    rutas_criticas: [src/backend/billing/, docker-compose.prod.yml]\n",
+                encoding="utf-8",
+            )
+            block = _format_project_ownership_block("ADEN_CRM", None, home=Path(td))
+            self.assertIn("PROJECT OWNERSHIP (docs/OWNERSHIP.yaml — ADEN_CRM):", block)
+            self.assertIn("Owner: aden | Class: P (vivo)", block)
+            self.assertIn("integration=dev, production=main", block)
+            self.assertIn("src/backend/billing/", block)
+
+            prompt = _build_child_system_prompt(project_ownership_block=block)
+            self.assertIn("PROJECT OWNERSHIP (docs/OWNERSHIP.yaml — ADEN_CRM):", prompt)
 
 
 if __name__ == "__main__":

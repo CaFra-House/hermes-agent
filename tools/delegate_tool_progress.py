@@ -6,8 +6,10 @@ import logging
 import enum
 import os
 import posixpath
+import re
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
 
@@ -174,8 +176,98 @@ _NESTED_CHILDREN_NOTE = (
     "from the nesting depth; children at the maximum depth cannot delegate further. No parameter override is available."
 )
 
+_BRIEF_PROJECT_RE = re.compile(r"(?im)\bPROYECTO\s*:\s*`?([A-Za-z0-9_.\-/]+)`?")
+_BRIEF_RUTA_RE = re.compile(r"(?im)\bRUTA\s*:\s*`?([^\s|`\"'\n\r,;]+)`?")
+
+
+def _extract_brief_project_and_path(goal: Optional[str], context: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """CAFRA 2026-11-19: Extract explicit ``PROYECTO: <slug>`` and ``RUTA: <path>`` from a delegation brief."""
+    combined = "\n".join(part for part in (context, goal) if isinstance(part, str) and part.strip())
+    if not combined:
+        return None, None
+    m_proj = _BRIEF_PROJECT_RE.search(combined)
+    m_ruta = _BRIEF_RUTA_RE.search(combined)
+    proj = m_proj.group(1).strip().rstrip(".,;:") if m_proj else None
+    ruta = m_ruta.group(1).strip().rstrip(".,;:") if m_ruta else None
+    return (proj or None), (ruta or None)
+
+
+def _format_project_ownership_block(
+    project_slug: Optional[str], ruta: Optional[str], home: Optional[Path] = None,
+) -> str:
+    """CAFRA 2026-11-19: Return a compact (~6-line) OWNERSHIP.yaml summary for the delegated project."""
+    if not project_slug and not ruta:
+        return ""
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        candidates: list[Path] = []
+        if home is not None:
+            candidates.append(Path(home) / "docs" / "OWNERSHIP.yaml")
+        cur_home = Path(get_hermes_home())
+        candidates.append(cur_home / "docs" / "OWNERSHIP.yaml")
+        # Secondary profiles under <root>/profiles/<name> share <root>/docs/OWNERSHIP.yaml.
+        if cur_home.parent.name == "profiles":
+            candidates.append(cur_home.parent.parent / "docs" / "OWNERSHIP.yaml")
+        ownership_path = next((p for p in candidates if p.is_file()), None)
+        if ownership_path is None:
+            return ""
+        data = yaml.safe_load(ownership_path.read_text(encoding="utf-8")) or {}
+        repos = data.get("repos")
+        if not isinstance(repos, dict):
+            return ""
+
+        matched_name, matched_entry = None, None
+        slug_norm = (project_slug or "").strip().lower()
+        ruta_norm = (ruta or "").strip().replace("\\", "/").rstrip("/").lower()
+        ruta_base = Path(ruta).name.lower() if ruta else ""
+
+        for name, entry in repos.items():
+            if not isinstance(entry, dict):
+                continue
+            name_low = str(name).lower()
+            if slug_norm and (name_low == slug_norm or name_low.replace("_", "-") == slug_norm.replace("_", "-")):
+                matched_name, matched_entry = str(name), entry
+                break
+        if matched_entry is None and ruta_norm:
+            for name, entry in repos.items():
+                if not isinstance(entry, dict):
+                    continue
+                rl = str(entry.get("ruta_local") or "").replace("\\", "/").rstrip("/").lower()
+                if (rl and (ruta_norm == rl or ruta_norm.startswith(rl + "/") or rl.startswith(ruta_norm + "/"))) or (
+                    ruta_base and str(name).lower() == ruta_base
+                ):
+                    matched_name, matched_entry = str(name), entry
+                    break
+        if matched_entry is None:
+            return ""
+
+        lines = [f"\nPROJECT OWNERSHIP (docs/OWNERSHIP.yaml — {matched_name}):"]
+        owner = matched_entry.get("owner") or "?"
+        clase = matched_entry.get("clase") or "?"
+        estado = matched_entry.get("estado") or "?"
+        code_owners = ", ".join(matched_entry.get("code_owners") or []) or "—"
+        reviewers = ", ".join(matched_entry.get("reviewers") or []) or "—"
+        lines.append(f"- Owner: {owner} | Class: {clase} ({estado}) | Code owners: {code_owners} | Reviewers: {reviewers}")
+        integ = matched_entry.get("rama_integracion") or matched_entry.get("default_rama") or "?"
+        prod = matched_entry.get("rama_produccion") or "?"
+        lines.append(f"- Branches: integration={integ}, production={prod} (cut feature branches from '{integ}')")
+        if matched_entry.get("ruta_local"):
+            lines.append(f"- Canonical local path: {matched_entry['ruta_local']}")
+        crit = matched_entry.get("rutas_criticas") or []
+        if crit:
+            shown = ", ".join(str(c) for c in crit[:6])
+            more = f" (+{len(crit) - 6} more)" if len(crit) > 6 else ""
+            lines.append(f"- Critical paths: {shown}{more}")
+        return "\n".join(lines)
+    except Exception:
+        logger.debug("subagent: OWNERSHIP.yaml lookup skipped", exc_info=True)
+        return ""
+
+
 def _build_child_system_prompt(
     *, workspace_path: Optional[str] = None, role: str = "leaf", max_spawn_depth: int = 2, child_depth: int = 1,
+    project_ownership_block: Optional[str] = None,
 ) -> str:
     """Focused system prompt for a child agent. role='orchestrator' appends a delegation-capability block (modeled on
     OpenClaw's buildSubagentSystemPrompt); its depth note is literal truth grounded in the passed config so the LLM
@@ -202,6 +294,8 @@ def _build_child_system_prompt(
             _ctx_files = build_context_files_prompt(cwd=str(workspace_path), skip_soul=True)
         if _ctx_files.strip():
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
+    if project_ownership_block and project_ownership_block.strip():
+        parts.append(project_ownership_block.strip())
     parts.append(_COMPLETION_INSTRUCTIONS)
     if role == "orchestrator":
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE

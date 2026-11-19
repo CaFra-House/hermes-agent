@@ -971,3 +971,9 @@ class MemoryManager:
                 self._drop_provider(provider)
         self._each_provider("initialize failed", lambda p: p.initialize(session_id=session_id, **kwargs),
                             level=logging.WARNING)
+        if self._allow_fork_hooks and self._agent_context == "subagent":
+            # CAFRA 2026-11-19: Subagents run 1 user turn; force synchronous Turn-1 recall so
+            # auto_recall (prefetch_all) populates Hindsight context immediately on Turn 1.
+            for provider in self._providers:
+                if provider.name != "builtin" and hasattr(provider, "_recall_sync"):
+                    provider._recall_sync = True
