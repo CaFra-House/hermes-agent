@@ -263,8 +263,15 @@ def is_row_rejection(exc: BaseException) -> bool:
     if isinstance(exc, PersistenceError) and isinstance(exc.__cause__, sqlite3.Error):
         exc = exc.__cause__
     if isinstance(exc, sqlite3.Error):
-        return (isinstance(exc, (sqlite3.InterfaceError, sqlite3.ProgrammingError))
-                and "binding parameter" in str(exc).lower())
+        if (isinstance(exc, (sqlite3.InterfaceError, sqlite3.ProgrammingError))
+                and "binding parameter" in str(exc).lower()):
+            return True
+        # LOCAL PATCH (CaFra, spool-orphan incident 09/26-10/08): a FOREIGN KEY failure here means
+        # the payload's session row no longer exists in ``sessions`` — no retry can ever succeed and
+        # the file re-warns on every boot from the replay glob. Upstream keeps all constraint errors
+        # retryable; quarantine FK orphans like a binding rejection (``.bad`` keeps forensics).
+        if isinstance(exc, sqlite3.IntegrityError) and "foreign key" in str(exc).lower():
+            return True
     return isinstance(exc, (TypeError, ValueError, AttributeError, OverflowError))
 
 
@@ -442,8 +449,19 @@ def _recover_one_payload(persistence, path: Path, payload: dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    target.messages.append(session_id, NewMessage(role="user", content=text,
-                                                  timestamp=payload.get("ts", int(time.time()))))
+    # LOCAL PATCH (CaFra): same row-rejection contract as the cap-drop path above — a rejected row
+    # (FK orphan / bad binding) is permanent, so it must be quarantined out of the replay glob
+    # instead of re-warning on every boot (spool-orphan incident 09/26-10/08). Transient failures
+    # keep upstream behavior: block the session and let the outer boundary hold the file.
+    try:
+        target.messages.append(session_id, NewMessage(role="user", content=text,
+                                                      timestamp=payload.get("ts", int(time.time()))))
+    except Exception as exc:
+        if is_row_rejection(exc):
+            _quarantine_spool_file(path, session_id, exc)
+            return False
+        blocked_sessions[session_id] = blocked_sessions.get(session_id, 0) + 1
+        raise
     return True
 
 

@@ -250,6 +250,13 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         # Broadcast pseudo-chats are filtered even in self-chat mode (fromMe events).
         if self._is_broadcast_chat(chat_id):
             return False
+        # Emoji reactions must NEVER trigger LLM inference or conversation turns
+        if (
+            data.get("mediaType") == "reaction"
+            or data.get("nativeType") == "reactionMessage"
+            or str(data.get("body") or "").strip().startswith("[Reaction:")
+        ):
+            return False
         if not data.get("isGroup", False):
             # DMs that pass the policy gate are always processed
             return self._is_dm_intake_allowed(str(data.get("senderId") or data.get("from") or ""))

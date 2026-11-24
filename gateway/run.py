@@ -702,7 +702,39 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
-    if _looks_like_gateway_provider_error(redacted):
+
+    # WhatsApp shielding: prevent leaking technical API errors, 401/403, or CLI commands to patients/clients
+    platform_val = _gateway_platform_value(platform)
+    is_whatsapp = platform_val in ("whatsapp", "whatsapp_cloud")
+    _err_indicators = (
+        "rejected your api key",
+        "rejected the request",
+        "provider said:",
+        "key_model_access_denied",
+        "token_not_found",
+        "authenticationerror",
+        "ratelimiterror",
+        "failed_turn",
+        "your request was not processed",
+        "this turn did not complete",
+        "hermes doctor",
+        "/model",
+        "/retry",
+        "/login",
+    )
+    lower_text = redacted.lower()
+    is_provider_error = _looks_like_gateway_provider_error(redacted) or any(
+        ind in lower_text for ind in _err_indicators
+    )
+
+    if is_whatsapp and is_provider_error:
+        logger.warning(
+            "[_sanitize_gateway_final_response] WhatsApp technical error shielded from client: %s",
+            redacted[:200],
+        )
+        return ""  # Shield client completely; no technical jargon or API codes sent
+
+    if is_provider_error:
         return _gateway_provider_error_reply(redacted)
     return redacted
 

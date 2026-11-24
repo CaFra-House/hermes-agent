@@ -32,6 +32,23 @@ def _wenv(name: str, default: str = "") -> str:
 
 logger = logging.getLogger(__name__)
 
+# PATIENT-SURFACE GUARD (ADEN local patch, 2026-09-29): internal machinery notices
+# that must NEVER be delivered to a patient chat. The config-level
+# display.platforms.<plat>.suppress_warning_notifications covers buffered status
+# diagnostics, but the failed-turn notice (agent/turn_failure_copy.py) and the
+# delivery-ledger recovery marker (gateway/delivery_ledger.py) ride the FINAL
+# response path and bypass it. Matched against the whole outgoing content.
+RECOVERED_REPLY_MARKER_PREFIX = "♻️ Recovered reply"
+INTERNAL_NOTICE_MARKERS = (
+    "⏳ Gateway is",  # drain gate ("...is not accepting new work right now")
+    "Your request was not processed. Send it again",  # FAILED_TURN_NOTICE
+    "This turn did not complete. Some actions may already have run",  # PARTIAL_FAILED_TURN_NOTICE
+    "rejected the request and retrying won't help",  # provider guidance (non-retryable)
+    "rejected your API key",  # provider guidance (auth)
+    "Authentication failed and could not be refreshed",  # fallback diagnostic
+    "Model fallback:",  # fallback diagnostic
+)
+
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
@@ -686,6 +703,7 @@ _BRIDGE_PASSTHROUGH_ENV = (
     "WHATSAPP_GROUP_ALLOWED_USERS", "WHATSAPP_GROUP_ALLOW_FROM", "WHATSAPP_REQUIRE_MENTION",
     "WHATSAPP_MENTION_PATTERNS", "WHATSAPP_FREE_RESPONSE_CHATS", "WHATSAPP_DEBUG",
     "WHATSAPP_FORWARD_OWNER_MESSAGES", "WHATSAPP_MAX_MESSAGE_LENGTH",
+    "WHATSAPP_TAKEOVER", "WHATSAPP_TAKEOVER_TTL_HOURS",
     "WHATSAPP_CHUNK_DELAY_MS", "WHATSAPP_SEND_TIMEOUT_MS",
 )
 # Everything a bridge bakes in at startup and never re-reads: the passthrough env plus the keys
@@ -736,6 +754,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
             WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
         extra = config.extra
+        # interactive_resume: when False, a gateway restart does NOT emit a "session
+        # restored" acknowledgement on this platform (reception profiles: the patient
+        # must never see internal machinery — config: platforms.whatsapp.interactive_resume).
+        self.interactive_resume = bool(extra.get("interactive_resume", True))
         from hermes_constants import get_hermes_home
         self._profile_home = get_hermes_home()
         self._bridge_process: Optional[subprocess.Popen] = None
@@ -750,6 +772,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except ValueError as exc:
             logger.warning("[whatsapp] %s; using port 3000", exc)
             self._bridge_port = 3000
+        # reply_to_mode: "off" never threads (no quote of the patient's message),
+        # "first" quotes only the first chunk (default), "all" every chunk. Mirrors
+        # Telegram/Discord so WhatsApp can be a clean end-user surface.
+        self._reply_to_mode: str = getattr(config, "reply_to_mode", "first") or "first"
         self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
         self._session_path = _session_dir(extra)
         self._reply_prefix: Optional[str] = extra.get("reply_prefix")
@@ -1291,6 +1317,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Format markdown for WhatsApp, chunk preserving code blocks, send sequentially."""
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        # PATIENT-SURFACE GUARD (ADEN local patch, 2026-09-29): internal machinery
+        # notices must NEVER reach a patient chat. The config-level
+        # suppress_warning_notifications covers buffered diagnostics, but the
+        # failed-turn notice and the delivery-ledger ♻️ marker ride the FINAL
+        # response path. Block them at the last chokepoint before the bridge.
+        # Checked against the WHOLE content: the notice can be appended after a
+        # partial response ("{response}\n\n{notice}"), not just at the head.
+        if content.startswith(RECOVERED_REPLY_MARKER_PREFIX) or any(
+            m in content for m in INTERNAL_NOTICE_MARKERS
+        ):
+            logger.warning(
+                "WhatsApp: blocked internal notice from patient surface (%d chars): %r",
+                len(content), content[:80],
+            )
+            return SendResult(success=True, message_id=None)
         chat_id = to_whatsapp_jid(chat_id)
         try:
             chunks = self.truncate_message(self.format_message(_format_whatsapp_markdown(content)), self._outgoing_chunk_limit())
@@ -1301,7 +1342,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # LOCAL CaFra (15/11): con WHATSAPP_NO_QUOTE=true no se cita el mensaje del
                 # paciente; un humano no responde siempre con "Responder" (orden de Julio).
                 _quote_off = str(os.getenv("WHATSAPP_NO_QUOTE", "")).strip().lower() in ("1", "true", "yes", "on")
-                if reply_to and idx == 0 and not _quote_off:
+                # reply_to_mode "off" suppresses the quote entirely (clean end-user surface).
+                if reply_to and idx == 0 and self._reply_to_mode != "off" and not _quote_off:
                     payload["replyTo"] = reply_to  # Reply-to on the first chunk only.
                 result = await self._post_bridge_message("send", payload, timeout=30)
                 if not result.success:

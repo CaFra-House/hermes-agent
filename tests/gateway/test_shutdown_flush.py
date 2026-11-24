@@ -327,3 +327,49 @@ def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monke
     replayed = []
     assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
     assert replayed == [{"role": "user", "content": "hi"}]
+
+
+def test_recover_quarantines_fk_orphan_and_continues(tmp_path, monkeypatch):
+    """A payload whose session_id no longer exists in ``sessions`` raises
+    ``sqlite3.IntegrityError`` (FOREIGN KEY).  That failure is permanent: the row can
+    never be inserted, so the file must be quarantined out of the replay glob instead of
+    being preserved and re-poisoning every subsequent boot.  Sibling payloads must still
+    recover, and a second pass must see no poison file left behind.
+    """
+    import sqlite3
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    orphan = _write_flush_file(flush_dir, "pending-a.json", "sid-gone", "orphaned msg")
+    good = _write_flush_file(flush_dir, "pending-b.json", "sid-live", "live msg")
+
+    class _Messages:
+        def __init__(self):
+            self.appended = []
+
+        def append(self, session_id, message):
+            if session_id == "sid-gone":
+                raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+            self.appended.append(session_id)
+
+    class FkFailingPersistence:
+        def __init__(self):
+            self.messages = _Messages()
+
+    db = FkFailingPersistence()
+    assert recover_pending_to_db(persistence=db) == 1
+    assert db.messages.appended == ["sid-live"]
+    # The live file is consumed; the FK orphan is NOT deleted — upstream's ``.bad`` quarantine
+    # suffix takes it out of the ``*.json`` replay glob while keeping the payload on disk.
+    assert not good.exists()
+    assert not orphan.exists()
+    quarantined = flush_dir / "pending-a.json.bad"
+    assert quarantined.exists()
+    # The payload is preserved verbatim for forensics.
+    assert json.loads(quarantined.read_text(encoding="utf-8"))["data"]["session_id"] == "sid-gone"
+    # No poison file remains in the replay glob: a second boot pass is a clean no-op.
+    assert list(flush_dir.glob("*.json")) == []
+    assert recover_pending_to_db(persistence=db) == 0
+    assert db.messages.appended == ["sid-live"]

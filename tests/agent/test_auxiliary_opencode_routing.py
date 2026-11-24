@@ -38,13 +38,15 @@ _WIRE_BY_MODEL = [
     ("minimax-m2.5", aux.AnthropicAuxiliaryClient),
     ("glm-5", OpenAI),
 ]
+# CaFra aliases retired glm-5 -> glm-5.3-flash in normalize_model_for_provider().
+_EXPECTED_RESOLVED = {"glm-5": "glm-5.3-flash"}
 
 
 @pytest.mark.parametrize("model, expected", _WIRE_BY_MODEL)
 @pytest.mark.parametrize("stale_api_mode", [None, "chat_completions"])
 def test_builtin_opencode_go_client_follows_the_model_not_the_persisted_mode(model, expected, stale_api_mode):
     client, resolved = aux.resolve_provider_client("opencode-go", model=model, api_mode=stale_api_mode)
-    assert resolved == model
+    assert resolved == _EXPECTED_RESOLVED.get(model, model)
     assert type(client) is expected
     async_client, _ = aux.resolve_provider_client("opencode-go", model=model, api_mode=stale_api_mode, async_mode=True)
     assert (type(async_client) is aux.AsyncCodexAuxiliaryClient) == (expected is aux.CodexAuxiliaryClient)
@@ -54,7 +56,7 @@ def test_builtin_opencode_go_client_follows_the_model_not_the_persisted_mode(mod
 def test_named_custom_opencode_family_entry_follows_the_model(model, expected):
     """An ``opencode-go-*`` custom entry without an api_mode of its own gets each model's wire, like main."""
     client, resolved = aux.resolve_provider_client("custom:opencode-go-bridge", model=model)
-    assert resolved == model
+    assert resolved == _EXPECTED_RESOLVED.get(model, model)
     assert type(client) is expected
     if expected is aux.AnthropicAuxiliaryClient:
         assert str(client._real_client.base_url).rstrip("/") == "https://opencode.ai/zen/go"

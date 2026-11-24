@@ -927,6 +927,51 @@ def maybe_auto_title(
     UNSTARTED for the caller to hand to ``start_title_upgrade`` once the turn's model request settled."""
     if not session_db or not session_id or not user_message:
         return None
+    # Reception profiles (config: auxiliary.title_generation.title_from_display_name=true):
+    # title the session with the peer's display name (WhatsApp pushName / Telegram name)
+    # instead of a topic summary — the conversation IS the patient, not the first question.
+    # ``user`` provenance so a later LLM/derived pass never clobbers it; a manual /title
+    # (also ``user``) is respected by only writing when the row isn't already user-titled.
+    try:
+        if _title_config().get("title_from_display_name"):
+            if persistence is not None:
+                _row = persistence.sessions.get(session_id)
+                _name = str(_row.display_name).strip() if _row and _row.display_name else ""
+                _cur_title = _row.title if _row else None
+                _cur_source = (
+                    _row.title_source.value
+                    if _row and hasattr(_row.title_source, "value")
+                    else (_row.title_source if _row else None)
+                )
+            else:
+                _row = session_db._read_one(
+                    "SELECT display_name, title, title_source FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                _name = str(_row["display_name"]).strip() if _row and _row["display_name"] else ""
+                _cur_title = _row["title"] if _row else None
+                _cur_source = _row["title_source"] if _row else None
+            if _name:
+                if _cur_title != _name and _cur_source != "user":
+                    if persistence is not None:
+                        try:
+                            persistence.sessions.set_title(session_id, _name)
+                        except ValueError:
+                            # unique-title collision (same patient, 2nd session) -> dedupe suffix
+                            _deduped = persistence.sessions.next_title_in_lineage(_name)
+                            if _deduped and _deduped != _name:
+                                persistence.sessions.set_title(session_id, _deduped)
+                    else:
+                        try:
+                            session_db.set_session_title(session_id, _name)
+                        except ValueError:
+                            _next = getattr(session_db, "get_next_title_in_lineage", None)
+                            _deduped = _next(_name) if _next else None
+                            if _deduped and _deduped != _name:
+                                session_db.set_session_title(session_id, _deduped)
+                return None  # display name is the title; skip LLM/derived titling
+    except Exception:
+        logger.debug("Display-name titling skipped", exc_info=True)
     # History may be pre- or post-message. Past the opening turn, skip once the session holds an
     # ``llm``/``user`` name: count alone left a machinery-opened session nameless, and a ``derived``
     # name is still a placeholder (instant slice, or the model's greeting title for a bare "hi") that

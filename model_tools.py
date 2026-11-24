@@ -673,10 +673,21 @@ class _CallIds:
     turn_id: Optional[str] = None
     api_request_id: Optional[str] = None
     conversation_id: Optional[str] = None  # compression-stable root (agent.prompt_cache_scope.conversation_id)
+    platform: Optional[str] = None
+    delegate_depth: Optional[str] = None
+    subagent_id: Optional[str] = None
 
     def hook_kwargs(self) -> dict[str, str]:
-        """Same fields with None -> "" (hook/middleware wire contract)."""
-        return {k: v or "" for k, v in asdict(self).items()}
+        """Same fields with None -> "" (hook/middleware wire contract); omit unset ambient identity."""
+        out = {
+            k: getattr(self, k) or ""
+            for k in ("task_id", "session_id", "tool_call_id", "turn_id", "api_request_id", "conversation_id")
+        }
+        for k in ("platform", "delegate_depth", "subagent_id"):
+            val = getattr(self, k)
+            if val is not None:
+                out[k] = val
+        return out
 
 
 def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Optional[str], Optional[str]]:
@@ -703,6 +714,7 @@ def _emit_post_tool_call_hook(
     turn_id: Optional[str] = None, api_request_id: Optional[str] = None, duration_ms: int = 0,
     status: Optional[str] = None, error_type: Optional[str] = None, error_message: Optional[str] = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None, conversation_id: Optional[str] = None,
+    platform: Optional[str] = None, delegate_depth: Optional[str] = None, subagent_id: Optional[str] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
@@ -716,7 +728,7 @@ def _emit_post_tool_call_hook(
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
         invoke_hook(
             "post_tool_call", tool_name=function_name, args=function_args, result=result,
-            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id).hook_kwargs(),
+            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id, platform, delegate_depth, subagent_id).hook_kwargs(),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
             middleware_trace=list(middleware_trace or []),
         )

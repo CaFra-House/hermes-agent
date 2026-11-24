@@ -219,6 +219,8 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     if _oc_family is not None:
         if "/" in name:
             name = name.split("/", 1)[1].strip() or name
+        if name.lower() in ("glm-5", "glm5"):
+            return "glm-5.3-flash"
         if _oc_family == "opencode-zen" and name.lower().startswith("claude-"):
             return _dots_to_hyphens(name)
         return name
