@@ -1141,6 +1141,10 @@ def _get_pre_tool_call_directive_details(
     tool_name: str, args: Optional[dict[str, Any]], task_id: str = "", session_id: str = "",
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[list[dict[str, Any]]] = None, conversation_id: str = "",
+    # CAFRA 2026-11-19 (orchestrator-guard): identidad del agente para el hook. Los callers la
+    # pasan por **hook_kwargs (remember_identity / current_identity); sin estos parámetros la
+    # firma lanzaba TypeError y el except del caller dejaba el hook sin ejecutar.
+    platform: str = "", delegate_depth: int = 0, subagent_id: str = "",
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
     the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
@@ -1157,6 +1161,8 @@ def _get_pre_tool_call_directive_details(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
         task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=list(middleware_trace or []), conversation_id=conversation_id,
+        # CAFRA 2026-11-19: el payload del shell hook necesita la identidad (padre vs subagente).
+        platform=platform, delegate_depth=delegate_depth, subagent_id=subagent_id,
     )
     modified_args: Optional[dict[str, Any]] = None
     first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)

@@ -96,6 +96,23 @@ def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
     # Resolve in the firing execution before the descendant environment is scrubbed.
     # This is payload metadata, never permission for the hook to act as the worker.
     extra["kanban_task_id"] = owned_kanban_task()
+    # CAFRA 2026-11-19 (orchestrator-guard): la identidad del agente viaja siempre en el
+    # payload — top-level y en extra — para que un hook pre_tool_call distinga orquestador
+    # (depth 0) de subagente (depth >= 1). Sin esto el hook no tiene con qué decidir.
+    try:
+        from agent.hook_identity import current_identity
+        identity = current_identity()
+    except Exception:
+        identity = {}
+    platform = kwargs.get("platform") or extra.get("platform") or identity.get("platform") or ""
+    depth_raw = kwargs.get("delegate_depth")
+    if depth_raw is None:
+        depth_raw = extra.get("delegate_depth", identity.get("delegate_depth", 0))
+    try:
+        delegate_depth = max(int(depth_raw), 0)
+    except (TypeError, ValueError):
+        delegate_depth = 0
+    subagent_id = kwargs.get("subagent_id") or extra.get("subagent_id") or identity.get("subagent_id") or ""
     return {
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
@@ -103,6 +120,9 @@ def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
         "cwd": cwd,
         # Resolved at fire time: a multiplexed gateway's hook script must know which profile fired it.
         "profile": get_active_profile_name(),
+        "platform": str(platform),
+        "delegate_depth": delegate_depth,
+        "subagent_id": str(subagent_id),
         "extra": extra,
     }
 

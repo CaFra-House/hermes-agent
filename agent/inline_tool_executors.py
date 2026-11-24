@@ -20,8 +20,15 @@ from tools.arg_validation import call_with_arg_checks
 from tools.registry import registry
 
 
-def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) -> dict[str, str]:
-    """Identity kwargs every tool hook/middleware call carries (all coerced to ``""``)."""
+def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) -> dict[str, object]:
+    """Identity kwargs every tool hook/middleware call carries (ids coerced to ``""``).
+
+    CAFRA 2026-11-19 (orchestrator-guard): ``platform`` / ``delegate_depth`` /
+    ``subagent_id`` ride along so a policy hook can tell the orchestrator (depth 0) from
+    a delegated subagent; the same identity is remembered in the context for the
+    dispatch paths that reach a hook with no agent in hand.
+    """
+    from agent.hook_identity import remember_identity
     return {
         "task_id": effective_task_id or "",
         "session_id": getattr(agent, "session_id", "") or "",
@@ -29,6 +36,7 @@ def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) ->
         "turn_id": getattr(agent, "_current_turn_id", "") or "",
         "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
         "conversation_id": conversation_id(agent),
+        **remember_identity(agent),
     }
 
 

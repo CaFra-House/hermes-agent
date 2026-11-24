@@ -803,8 +803,12 @@ def _pre_dispatch_guards(function_name: str, function_args: dict[str, Any], skip
         block_message: Optional[str] = None
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+            from agent.hook_identity import current_identity
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
+                # CAFRA 2026-11-19: este camino no tiene el agente a mano; la identidad
+                # (platform/delegate_depth/subagent_id) viene del contexto del tool call.
+                function_name, function_args, middleware_trace=list(middleware_trace),
+                **current_identity(), **ids.hook_kwargs(),
             )
             if modified_args is not None:
                 function_args = modified_args
